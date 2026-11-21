@@ -71,8 +71,10 @@ const SUIT_META = {
   swords: { name: 'Swords', short: 'SWD', color: 'text-rose-400', bg: 'bg-rose-950/60', border: 'border-rose-500/50', desc: 'Destroy 1 Pouch card' },
   wands: { name: 'Wands', short: 'WND', color: 'text-violet-400', bg: 'bg-violet-950/60', border: 'border-violet-500/50', desc: 'Force 1 Hand discard' },
   pentacles: { name: 'Pentacles', short: 'PNT', color: 'text-emerald-400', bg: 'bg-emerald-950/60', border: 'border-emerald-500/50', desc: 'Draw 1 from Deck' },
-  cups: { name: 'Cups', short: 'CUP', color: 'text-sky-400', bg: 'bg-sky-950/60', border: 'border-sky-500/50', desc: 'Take top of Grave' }
+  cups: { name: 'Cups', short: 'CUP', color: 'text-sky-400', bg: 'bg-sky-950/60', border: 'border-sky-500/50', desc: 'Take top of Grave' },
+  major: { name: 'Major Arcana', short: 'MAJ', color: 'text-amber-400', bg: 'bg-amber-950/60', border: 'border-amber-500/50', desc: 'Major Arcana Trump / Chaos' }
 };
+const getCardSuit = (c) => (!c ? null : (c.type === 'major' ? 'major' : c.suit));
 
 const RANK_LABELS = {
   1: 'A', 2: '2', 3: '3', 4: '4', 5: '5', 6: '6', 7: '7', 8: '8', 9: '9', 10: '10',
@@ -97,7 +99,7 @@ const PATHWAYS = [
   {
     id: 0, arcana: 'The Fool', lotm: 'Seer', lever: 'Deck Top & Suit-Guess',
     playstyle: 'Chaotic trope-hopping: divination, paper figurines, faceless copying, marionettes & historical projections.',
-    chaosTiming: 'Trick', chaosDesc: 'Swap the center Trump Card with 1 Minor Arcana card from your Hand.',
+    chaosTiming: 'Trick', chaosDesc: 'Swap the center Trump Card with 1 card from your Hand.',
     seqs: {
       9: { name: 'Seer', ability: 'Peek & reorder the top 2 cards of the Deck (moves best card to top).', acting: 'Win a trick & succeed on Suit-Guess Gamble.', tag: 'peek_deck_2' },
       8: { name: 'Clown', ability: 'Paper Figurine: Shield your Pouch from the next Sword this round (swap with Hand).', acting: 'Survive a round losing 0 Pouch cards.', tag: 'clown_shield' },
@@ -241,7 +243,7 @@ const PATHWAYS = [
   {
     id: 9, arcana: 'The Hermit', lotm: 'White Tower (Reader)', lever: 'Hand Deduction & Copying',
     playstyle: 'Information mastery: guesses hidden Hand cards for draws, copies abilities, and predicts winning Suits.',
-    chaosTiming: 'Anytime', chaosDesc: 'Take any 1 Minor Arcana card from the Grave into your Hand (before recycling 9).',
+    chaosTiming: 'Anytime', chaosDesc: 'Take the top card from the Grave into your Hand (before recycling 9).',
     seqs: {
       9: { name: 'Reader', ability: 'Speed Read: Peek at the top card of the Deck; keep it on top or move it to the bottom of the Deck.', acting: 'Guess a Suit correctly or use Reader.', tag: 'reader_scry' },
       8: { name: 'Student of Ratiocination', ability: "Deduce: Reveal 1 random card from target opponent's Hand and the top card of the Deck—you take one, opponent takes the other.", acting: "Reveal a card in an opponent's Hand.", tag: 'student_deduce' },
@@ -353,7 +355,7 @@ const PATHWAYS = [
   {
     id: 16, arcana: 'The Tower', lotm: 'Paragon (Savant)', lever: 'Face Cards & Alchemy Math',
     playstyle: 'Alchemy & artifacts: subtracts Pouch math, forges Face Cards into table Artifacts, and transmutes Suits.',
-    chaosTiming: 'Trick', chaosDesc: 'Destroy the center Trump Card and replace it with the top Minor Arcana in the Grave.',
+    chaosTiming: 'Trick', chaosDesc: 'Destroy the center Trump Card and replace it with the top card in the Grave.',
     seqs: {
       9: { name: 'Savant', ability: 'Precision Math: You may SUBTRACT Pouch card values when ascending this turn (e.g. 9-1=8).', acting: 'Play a Pentacle or hold 2+ Pouch cards.', tag: 'savant_subtract' },
       8: { name: 'Archaeologist', ability: 'Excavate: Look at bottom 3 cards of Deck and draw 1 into Hand.', acting: 'Draw or excavate a card from the Deck.', tag: 'draw_1_peek' },
@@ -916,7 +918,7 @@ A2=
 function cardShortName(c) {
   if (!c) return 'None';
   if (c.type === 'major') return `${c.roman}. ${c.name}`;
-  return `${c.label} of ${SUIT_META[c.suit].name}`;
+  return `${c.label} of ${SUIT_META[c.suit]?.name || c.suit}`;
 }
 
 function isNumberCard(c) {
@@ -1017,8 +1019,9 @@ function evaluateTrickWinner(plays, trumpCard, roundMods) {
       const hasTenSameSuit = eligible.some(o => (o.card.rank === 10 || o.isTenOverride) && o.effSuit === p.effSuit);
       if (hasTenSameSuit) val = 12; // Beats 10 and Iron-Blooded Knight 11!
     }
-    if (roundMods.invertTrick && tier > 0 && p.card.rank >= 1 && p.card.rank <= 9) {
-      val = 11 - val; // Lower wins!
+    if (roundMods.invertTrick && tier > 0) {
+      if (p.card.type === 'major') val = 21 - val; // Lower Major Arcana wins!
+      else if (p.card.rank >= 1 && p.card.rank <= 9) val = 11 - val; // Lower wins!
     }
     return { tier, val, tieBreak: p.winsTies ? 1 : 0 };
   };
@@ -2140,13 +2143,13 @@ function applyHeadlessAbility(actor, players, target, deck, grave, trumpCardRef,
     }
     case 'telepathist_reveal': {
       if (target && target.hand.length > 0) {
-        const ts = trumpCardRef.card?.suit;
+        const ts = getCardSuit(trumpCardRef.card);
         const pool = [...target.hand];
         let matches = 0;
         for (let k = 0; k < Math.min(2, pool.length); k++) {
           const rIdx = Math.floor(Math.random() * pool.length);
           const rev = pool.splice(rIdx, 1)[0];
-          if (ts && rev.suit === ts) matches++;
+          if (ts && getCardSuit(rev) === ts) matches++;
         }
         if (matches > 0) actor.hand.push(...drawN(matches));
         actor.actingDone = true;
@@ -2157,8 +2160,8 @@ function applyHeadlessAbility(actor, players, target, deck, grave, trumpCardRef,
     case 'prophet_foresight': actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 2; break;
     case 'steal_trump_hand': {
       if (target && target.hand.length > 0) {
-        const ts = trumpCardRef.card?.suit;
-        let idx = ts ? target.hand.findIndex(c => c.suit === ts) : -1;
+        const ts = getCardSuit(trumpCardRef.card);
+        let idx = ts ? target.hand.findIndex(c => getCardSuit(c) === ts) : -1;
         const stoleTrump = idx !== -1;
         if (idx === -1) idx = 0;
         actor.hand.push(target.hand.splice(idx, 1)[0]);
@@ -2250,8 +2253,8 @@ function applyHeadlessAbility(actor, players, target, deck, grave, trumpCardRef,
     }
     case 'soul_harvest': if (grave.length > 0) actor.hand.push(grave.shift()); if (grave.length >= 4) { actor.hand.push(...drawN(1)); actor.actingDone = true; } break;
     case 'grave_trump_pull': {
-      const ts = trumpCardRef.card?.suit;
-      const idx = grave.findIndex(c => c.type === 'minor' && (!ts || c.suit === ts));
+      const ts = getCardSuit(trumpCardRef.card);
+      const idx = grave.findIndex(c => !ts || getCardSuit(c) === ts);
       if (idx !== -1) { actor.hand.push(grave.splice(idx, 1)[0]); actor.actingDone = true; }
       else actor.hand.push(...drawN(1));
       break;
@@ -2343,7 +2346,7 @@ function applyHeadlessAbility(actor, players, target, deck, grave, trumpCardRef,
     case 'sun_boost': actor.mods.sunBoost = 3; break;
     case 'white_angel': actor.hand.push(...drawN(2)); for (const o of others) o.mods = {}; break;
     case 'arbiter_auth': actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 1; actor.mods.arbiterTrumpDraw = true; break;
-    case 'interrogator': if (target) { const ts = trumpCardRef.card?.suit; forceDiscard(target, ts && target.hand.some(c => c.suit === ts) ? 2 : 1); actor.actingDone = true; } break;
+    case 'interrogator': if (target) { const ts = getCardSuit(trumpCardRef.card); forceDiscard(target, ts && target.hand.some(c => getCardSuit(c) === ts) ? 2 : 1); actor.actingDone = true; } break;
     case 'forbid_swords': roundMods.forbidSuit = 'swords'; roundMods.forbidOwner = actor.id; actor.actingDone = true; break;
     case 'balancer_equalize': for (const o of others) { const diff = Math.min(2, Math.max(0, o.hand.length - actor.hand.length)); if (diff > 0) forceDiscard(o, diff); } break;
     case 'supreme_verdict': roundMods.abolishTrump = true; actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 2; break;
@@ -2464,7 +2467,7 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
       const keyVal = isKey ? (phaseTag === 'trick' ? -2.2 : 2.0) : 0;
       const pairVal = isPair ? (phaseTag === 'trick' ? -1.0 : 1.2) : 0;
       const rankStr = isMinor && c.rank <= 10 ? (phaseTag === 'trick' ? c.rank / 10 : (c.rank <= p.seq ? 0.5 : -0.8)) : 0;
-      const isTrump = isMinor && mockState.trumpCard && c.suit === mockState.trumpCard.suit ? (phaseTag === 'trick' ? 1.0 : 0.4) : 0;
+      const isTrump = mockState.trumpCard && getCardSuit(c) === getCardSuit(mockState.trumpCard) ? (phaseTag === 'trick' ? 1.0 : 0.4) : 0;
       const drawRescue = isMinor && ((c.suit === 'pentacles') || (c.suit === 'cups' && (mockState.grave?.length || 0) > 0)) && p.hand.length <= 4 ? 1.2 : 0;
       const defReserve = isMinor && (c.rank === 11 || c.rank === 12 || c.rank === 13) && phaseTag === 'trick' ? 1.8 : 0;
       let canWin = 0;
@@ -2473,7 +2476,7 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
           const simPlay = { playerId: p.id, card: c, effValue: Math.min(10, (c.rank <= 10 ? c.rank : 0) + (p.mods.trickBonus || 0)), effSuit: c.suit, isTenOverride: c.rank === 10 };
           const w = evaluateTrickWinner([...mockState.trickPlays, simPlay], mockState.trumpCard, mockState.roundMods || {});
           canWin = (w && w.playerId === p.id) ? 1.2 : -0.4;
-        } else if (c.rank === 10 || (mockState.trumpCard && c.suit === mockState.trumpCard.suit && c.rank >= 6)) {
+        } else if (c.rank === 10 || (mockState.trumpCard && getCardSuit(c) === getCardSuit(mockState.trumpCard) && (c.type === 'major' || c.rank >= 6))) {
           canWin = 0.6;
         }
       }
@@ -2730,7 +2733,7 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
           const cid = majorCard.majorId;
           const otherPs = players.filter(o => o.id !== p.id && !skippedThisRound.has(o.id));
           if (cid === 0) {
-            const m = p.hand.find(c => c.type === 'minor');
+            const m = p.hand[0];
             if (m && trumpCard) { p.hand = p.hand.filter(c => c.uid !== m.uid); p.hand.push(trumpCard); trumpCard = m; roundMods.trumpChanged = true; }
           } else if (cid === 1) {
             if (p.pouch.length > 0 && target && target.pouch.length > 0 && !target.mods.pouchImmune) { const aC = p.pouch.pop(); p.pouch.push(target.pouch.pop()); target.pouch.push(aC); }
@@ -2747,15 +2750,14 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
             }
           } else if (cid === 4) { roundMods.invertTrick = true; }
           else if (cid === 5) {
-            const reqS = trumpCard?.suit || 'swords';
-            for (const o of otherPs) if (!o.mods.handImmune && !roundMods.globalImmunity && !o.hand.some(c => c.suit === reqS) && o.hand.length > 0) discardSmart(o, grave, 1);
+            const reqS = getCardSuit(trumpCard) || 'swords';
+            for (const o of otherPs) if (!o.mods.handImmune && !roundMods.globalImmunity && !o.hand.some(c => getCardSuit(c) === reqS) && o.hand.length > 0) discardSmart(o, grave, 1);
           } else if (cid === 6) {
             if (p.hand.length > 0 && target && target.hand.length > 0) { const tmp = p.hand.pop(); p.hand.push(target.hand.pop()); target.hand.push(tmp); }
           } else if (cid === 7) { roundMods.noTrumpChariot = true; }
           else if (cid === 8) { roundMods.globalImmunity = true; }
           else if (cid === 9) {
-            const gi = grave.findIndex(c => c.type === 'minor');
-            if (gi !== -1) p.hand.push(grave.splice(gi, 1)[0]);
+            if (grave.length > 0) p.hand.push(grave.shift());
           } else if (cid === 10) {
             const passed = players.map(q => (q.hand.length > 0 ? q.hand.pop() : null));
             players.forEach((q, qi) => { const f = (qi - 1 + players.length) % players.length; if (passed[f]) q.hand.push(passed[f]); q.hand.push(...drawN(1)); });
@@ -2772,9 +2774,11 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
           else if (cid === 15) {
             for (const o of otherPs) { if (!roundMods.globalImmunity) { if (o.hand.length > 1 && !o.mods.handImmune) discardSmart(o, grave, 1); else if (o.pouch.length > 0 && !o.mods.pouchImmune) { grave.unshift(o.pouch.pop()); o.pouchLostThisRound = true; } } }
           } else if (cid === 16) {
-            if (trumpCard) grave.unshift(trumpCard);
-            const gi = grave.findIndex(c => c.type === 'minor');
-            if (gi !== -1) trumpCard = grave.splice(gi, 1)[0];
+            const oldT = trumpCard;
+            if (grave.length > 0) {
+              trumpCard = grave.shift();
+              if (oldT) grave.unshift(oldT);
+            }
             roundMods.trumpChanged = true;
           } else if (cid === 17) { p.hand.push(...drawN(1)); }
           else if (cid === 18) {
@@ -2844,12 +2848,13 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
         }
       } else {
         // Depth 3-6: Trump/Lead-aware Trick Play + Ascension Key Preservation
-        const tSuit = (!roundMods.abolishTrump && !roundMods.noTrumpChariot && trumpCard) ? trumpCard.suit : null;
+        const tSuit = (!roundMods.abolishTrump && !roundMods.noTrumpChariot && trumpCard) ? getCardSuit(trumpCard) : null;
         const curWinPlay = trickPlays.length > 0 ? evaluateTrickWinner(trickPlays, trumpCard, roundMods) : null;
         const scorePlayCard = (c) => {
+          if (c.type === 'major') return (tSuit === 'major' ? 14 : 4) + (c.majorId || 0) * 0.1;
           let sc = c.rank <= 10 ? c.rank : (c.rank === 14 ? 8 : 5);
           if (roundMods.invertTrick && c.rank <= 9) sc = 11 - sc;
-          if (p.depth >= 3 && tSuit && c.suit === tSuit && c.rank <= 10) sc += 6;
+          if (p.depth >= 3 && tSuit && getCardSuit(c) === tSuit && c.rank <= 10) sc += 6;
           if (p.depth >= 4 && curWinPlay) {
             const simPlay = { playerId: p.id, card: c, effValue: c.rank <= 10 ? c.rank : 0, effSuit: c.suit, isTenOverride: c.rank === 10, countsAsTrump: !!p.mods.countsAsTrump || (!!p.mods.cupsAreTrump && c.suit === 'cups'), faceCanWin: !!p.mods.faceCanWin, winsTies: !!p.mods.winsTies };
             const wouldWin = evaluateTrickWinner([...trickPlays, simPlay], trumpCard, roundMods)?.playerId === p.id;
@@ -2909,9 +2914,9 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
       if (p.mods.wandCupBonus && (chosen.suit === 'wands' || chosen.suit === 'cups') && chosen.rank <= 9) effVal = Math.min(9, effVal + p.mods.wandCupBonus);
       if (p.mods.sunBoost && (chosen.suit === 'cups' || chosen.suit === 'pentacles') && chosen.rank <= 9) effVal = Math.min(9, effVal + p.mods.sunBoost);
       const isLeadingPlay = trickPlays.length === 0;
-      const isTrumpCardPlay = !!(trumpCard && chosen.suit === trumpCard.suit && !roundMods.abolishTrump && !roundMods.noTrumpChariot);
+      const isTrumpCardPlay = !!(trumpCard && getCardSuit(chosen) === getCardSuit(trumpCard) && !roundMods.abolishTrump && !roundMods.noTrumpChariot);
       if (p.mods.nonTrumpPenalty && !isTrumpCardPlay && effVal > 1) effVal = Math.max(1, effVal - p.mods.nonTrumpPenalty);
-      if (p.mods.jackpotBoost && trumpCard && (chosen.suit === trumpCard.suit || chosen.rank === trumpCard.rank)) { effVal = Math.min(10, effVal + 4); p.actingDone = true; }
+      if (p.mods.jackpotBoost && trumpCard && (getCardSuit(chosen) === getCardSuit(trumpCard) || (chosen.rank && chosen.rank === trumpCard.rank))) { effVal = Math.min(10, effVal + 4); p.actingDone = true; }
       if (p.mods.trickPenalty && effVal > 1) effVal = Math.max(1, effVal - p.mods.trickPenalty);
       if (p.mods.sailorLeadDraw && isLeadingPlay) { p.hand.push(...drawN(1)); p.actingDone = true; }
       if (p.mods.arbiterTrumpDraw && isTrumpCardPlay) { p.hand.push(...drawN(1)); p.actingDone = true; }
@@ -3886,7 +3891,7 @@ export default function App() {
       const keyVal = isKey ? (phaseTag === 'trick' ? -2.2 : 2.0) : 0;
       const pairVal = isPair ? (phaseTag === 'trick' ? -1.0 : 1.2) : 0;
       const rankStr = isMinor && c.rank <= 10 ? (phaseTag === 'trick' ? c.rank / 10 : (c.rank <= p.seq ? 0.5 : -0.8)) : 0;
-      const isTrump = isMinor && state.trumpCard && c.suit === state.trumpCard.suit ? (phaseTag === 'trick' ? 1.0 : 0.4) : 0;
+      const isTrump = state.trumpCard && getCardSuit(c) === getCardSuit(state.trumpCard) ? (phaseTag === 'trick' ? 1.0 : 0.4) : 0;
       const drawRescue = isMinor && ((c.suit === 'pentacles') || (c.suit === 'cups' && (state.grave?.length || 0) > 0)) && p.hand.length <= 4 ? 1.2 : 0;
       const defReserve = isMinor && (c.rank === 11 || c.rank === 12 || c.rank === 13) && phaseTag === 'trick' ? 1.8 : 0;
       let canWin = 0;
@@ -3895,7 +3900,7 @@ export default function App() {
           const simPlay = { playerId: p.id, card: c, effValue: Math.min(10, (c.rank <= 10 ? c.rank : 0) + (p.mods.trickBonus || 0)), effSuit: c.suit, isTenOverride: c.rank === 10 };
           const w = evaluateTrickWinner([...state.trickPlays, simPlay], state.trumpCard, state.roundMods || {});
           canWin = (w && w.playerId === p.id) ? 1.2 : -0.4;
-        } else if (c.rank === 10 || (state.trumpCard && c.suit === state.trumpCard.suit && c.rank >= 6)) {
+        } else if (c.rank === 10 || (state.trumpCard && getCardSuit(c) === getCardSuit(state.trumpCard) && (c.type === 'major' || c.rank >= 6))) {
           canWin = 0.6;
         }
       }
@@ -4157,22 +4162,22 @@ export default function App() {
     }
 
     // Execute all 22 Chaos Effects
-    if (id === 0) { // Fool: swap Trump with Hand
-      const minors = actor.hand.filter(c => c.type === 'minor');
-      if (minors.length > 0 && s.trumpCard) {
+    if (id === 0) { // Fool: swap Trump with any Hand card
+      const swapCands = actor.hand;
+      if (swapCands.length > 0 && s.trumpCard) {
         if (actor.isHuman) {
           s.pendingInteraction = {
             type: 'HAND_SWAP_TRUMP',
             title: 'The Fool Chaos — Choose a Hand Card to Become the New Trump Card',
-            cards: minors
+            cards: swapCands
           };
         } else {
-          const minor = minors[0];
-          actor.hand = actor.hand.filter(c => c.uid !== minor.uid);
+          const chosenSwap = swapCands[0];
+          actor.hand = actor.hand.filter(c => c.uid !== chosenSwap.uid);
           actor.hand.push(s.trumpCard);
-          s.trumpCard = minor;
+          s.trumpCard = chosenSwap;
           s.roundMods.trumpChanged = true;
-          s.logs = addLog(s.logs, `Trump Card swapped to ${cardShortName(minor)}!`, 'chaos', `(T=${cardCode(minor)})`);
+          s.logs = addLog(s.logs, `Trump Card swapped to ${cardShortName(chosenSwap)}!`, 'chaos', `(T=${cardCode(chosenSwap)})`);
         }
       }
     } else if (id === 1) { // Magician: swap Pouch with opp
@@ -4237,9 +4242,9 @@ export default function App() {
       s.roundMods.invertTrick = true;
       s.logs = addLog(s.logs, `Emperor inverted the trick: LOWEST number wins!`, 'chaos', 'inv', { appendEffect: true });
     } else if (id === 5) { // Hierophant: opps without Trump Suit discard 1
-      const reqSuit = s.trumpCard?.suit || 'swords';
+      const reqSuit = getCardSuit(s.trumpCard) || 'swords';
       for (const o of others) {
-        if (!o.hand.some(c => c.suit === reqSuit) && o.hand.length > 0 && !o.mods.handImmune) {
+        if (!o.hand.some(c => getCardSuit(c) === reqSuit) && o.hand.length > 0 && !o.mods.handImmune) {
           if (o.isHuman) {
             s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: 1, destination: 'grave', selectedUids: [], appendEffect: true, effectPrefix: '#1: ', reason: `Hierophant Chaos: You lack ${SUIT_META[reqSuit].name} — choose 1 card to discard.` };
             s.logs = addLog(s.logs, `${o.name} lacked ${SUIT_META[reqSuit].name} and must choose 1 card to discard.`, 'chaos');
@@ -4266,10 +4271,9 @@ export default function App() {
     } else if (id === 8) { // Strength: all Pouches & Hands immune this turn
       s.roundMods.globalImmunity = true;
       s.logs = addLog(s.logs, `Strength protects all Pouches and Hands from Swords/Wands this round!`, 'chaos', 'immAll', { appendEffect: true });
-    } else if (id === 9) { // Hermit: take 1 Minor from Grave before recycle
-      const idx = s.grave.findIndex(c => c.type === 'minor');
-      if (idx !== -1) {
-        const taken = s.grave.splice(idx, 1)[0];
+    } else if (id === 9) { // Hermit: take top card from Grave before recycle
+      if (s.grave.length > 0) {
+        const taken = s.grave.shift();
         actor.hand.push(taken);
         s.logs = addLog(s.logs, `${actor.name} retrieved ${cardShortName(taken)} from the Grave.`, 'chaos', `+${cardCode(taken)}g`, { appendEffect: true });
       }
@@ -4348,10 +4352,12 @@ export default function App() {
         }
       }
       s.logs = addLog(s.logs, `The Devil forced every opponent to sacrifice a card!`, 'danger');
-    } else if (id === 16) { // Tower: destroy Trump, replace with top Minor in Grave
-      if (s.trumpCard) s.grave.unshift(s.trumpCard);
-      const idx = s.grave.findIndex(c => c.type === 'minor');
-      if (idx !== -1) s.trumpCard = s.grave.splice(idx, 1)[0];
+    } else if (id === 16) { // Tower: destroy Trump, replace with top card in Grave
+      const oldTrump = s.trumpCard;
+      if (s.grave.length > 0) {
+        s.trumpCard = s.grave.shift();
+        if (oldTrump) s.grave.unshift(oldTrump);
+      }
       s.roundMods.trumpChanged = true;
       s.logs = addLog(s.logs, `The Tower shattered the Trump Card! New Trump: ${cardShortName(s.trumpCard)}.`, 'chaos', `(T=${cardCode(s.trumpCard)})`);
     } else if (id === 17) { // Star: inspect opp Pouch + draw 1
@@ -5223,7 +5229,7 @@ export default function App() {
       }
       case 'telepathist_reveal': {
         if (target && target.hand.length > 0) {
-          const tSuit = s.trumpCard?.suit;
+          const tSuit = getCardSuit(s.trumpCard);
           const pool = [...target.hand];
           const revealed = [];
           let matches = 0;
@@ -5231,7 +5237,7 @@ export default function App() {
             const rIdx = Math.floor(Math.random() * pool.length);
             const rev = pool.splice(rIdx, 1)[0];
             revealed.push(rev);
-            if (tSuit && rev.suit === tSuit) matches++;
+            if (tSuit && getCardSuit(rev) === tSuit) matches++;
           }
           if (matches > 0) drawFor(actor, matches);
           if (actor.isHuman) s.logs = addLog(s.logs, `Read Mind revealed ${revealed.map(cardShortName).join(', ')} — drew ${matches} matching Trump Suit!`, 'info');
@@ -5259,8 +5265,8 @@ export default function App() {
       }
       case 'steal_trump_hand': {
         if (target && target.hand.length > 0) {
-          const tSuit = s.trumpCard?.suit;
-          let idx = tSuit ? target.hand.findIndex(c => c.suit === tSuit) : -1;
+          const tSuit = getCardSuit(s.trumpCard);
+          let idx = tSuit ? target.hand.findIndex(c => getCardSuit(c) === tSuit) : -1;
           const stoleTrump = idx !== -1;
           if (idx === -1) idx = 0;
           actor.hand.push(target.hand.splice(idx, 1)[0]);
@@ -5446,8 +5452,8 @@ export default function App() {
         break;
       }
       case 'grave_trump_pull': {
-        const tSuit = s.trumpCard?.suit;
-        const idx = s.grave.findIndex(c => c.type === 'minor' && (!tSuit || c.suit === tSuit));
+        const tSuit = getCardSuit(s.trumpCard);
+        const idx = s.grave.findIndex(c => !tSuit || getCardSuit(c) === tSuit);
         if (idx !== -1) {
           actor.hand.push(s.grave.splice(idx, 1)[0]);
           s.logs = markActed(actor, s.logs, 'Opened Underworld Gate');
@@ -5712,8 +5718,8 @@ export default function App() {
       }
       case 'interrogator': {
         if (target) {
-          const tSuit = s.trumpCard?.suit;
-          const hasTrump = tSuit && target.hand.some(c => c.suit === tSuit);
+          const tSuit = getCardSuit(s.trumpCard);
+          const hasTrump = tSuit && target.hand.some(c => getCardSuit(c) === tSuit);
           forceDiscard(target, hasTrump ? 2 : 1);
           s.logs = markActed(actor, s.logs, 'Interrogated opponent');
         }
@@ -5879,12 +5885,12 @@ export default function App() {
     if (actor.mods.sunBoost && (card.suit === 'cups' || card.suit === 'pentacles') && card.rank <= 9) {
       effValue = Math.min(9, effValue + actor.mods.sunBoost);
     }
-    if (actor.mods.jackpotBoost && s.trumpCard && (card.suit === s.trumpCard.suit || card.rank === s.trumpCard.rank)) {
+    if (actor.mods.jackpotBoost && s.trumpCard && (getCardSuit(card) === getCardSuit(s.trumpCard) || (card.rank && card.rank === s.trumpCard.rank))) {
       effValue = Math.min(10, effValue + 4);
       s.logs = markActed(actor, s.logs, 'Hit Jackpot match with Trump');
     }
     const isLeadingPlay = s.trickPlays.length === 0;
-    const isTrumpCardPlay = !!(s.trumpCard && card.suit === s.trumpCard.suit && !s.roundMods.abolishTrump && !s.roundMods.noTrumpChariot);
+    const isTrumpCardPlay = !!(s.trumpCard && getCardSuit(card) === getCardSuit(s.trumpCard) && !s.roundMods.abolishTrump && !s.roundMods.noTrumpChariot);
     if (actor.mods.nonTrumpPenalty && !isTrumpCardPlay && effValue > 1) {
       effValue = Math.max(1, effValue - actor.mods.nonTrumpPenalty);
     }
@@ -6142,7 +6148,7 @@ export default function App() {
       const winPlay = evaluateTrickWinner(s.trickPlays, s.trumpCard, s.roundMods);
       s.trickWinnerId = winPlay ? winPlay.playerId : 0;
       const winner = s.players[s.trickWinnerId];
-      s.logs = addLog(s.logs, `TRICK WINNER: ${winner.name} wins with ${cardShortName(winPlay.card)}!`, 'gold');
+      s.logs = addLog(s.logs, `TRICK WINNER: ${winner.name} wins with ${winPlay ? cardShortName(winPlay.card) : 'the trick'}!`, 'gold');
 
       // War Bishop War penalty on trick losers
       if (s.roundMods.warDeclared) {
@@ -6612,7 +6618,7 @@ export default function App() {
                 chosenCard = selectCardLiveHard(activeNet, s, aId, legal, 'trick') || legal[0];
               } catch (_) { chosenCard = legal[0]; }
             } else {
-              const tSuit = (!s.roundMods.abolishTrump && !s.roundMods.noTrumpChariot && s.trumpCard) ? s.trumpCard.suit : null;
+              const tSuit = (!s.roundMods.abolishTrump && !s.roundMods.noTrumpChariot && s.trumpCard) ? getCardSuit(s.trumpCard) : null;
               legal.sort((a, b) => {
                 const sc = (c) => {
                   if (c.type === 'major') return (s.trumpCard?.type === 'major' ? 14 : 4) + (c.majorId || 0) * 0.1;
@@ -6721,7 +6727,7 @@ export default function App() {
   const humanHasLeadSuit = useMemo(() => {
     if (!human || !leadSuit) return false;
     if (human.mods.countsAsTrump) return false;
-    return human.hand.some(c => c.type === 'minor' && c.suit === leadSuit);
+    return human.hand.some(c => getCardSuit(c) === leadSuit);
   }, [human, leadSuit]);
 
   const handleHumanPouchAdd = (card) => {
@@ -7995,23 +8001,23 @@ export default function App() {
                   const drawN = (n) => { const o = []; for (let i = 0; i < n && deck.length > 0; i++) o.push(deck.shift()); return o; };
                   p.hand = p.hand.filter(c => c.uid !== majorCard.uid);
                   const cid = majorCard.majorId;
-                  if (cid === 0) { const m = p.hand.find(c => c.type === 'minor'); if (m && hS.trumpCard) { p.hand = p.hand.filter(c => c.uid !== m.uid); p.hand.push(hS.trumpCard); hS.trumpCard = m; roundMods.trumpChanged = true; } }
+                  if (cid === 0) { const m = p.hand[0]; if (m && hS.trumpCard) { p.hand = p.hand.filter(c => c.uid !== m.uid); p.hand.push(hS.trumpCard); hS.trumpCard = m; roundMods.trumpChanged = true; } }
                   else if (cid === 1) { if (p.pouch.length > 0 && target.pouch.length > 0 && !target.mods.pouchImmune) { const aC = p.pouch.pop(); p.pouch.push(target.pouch.pop()); target.pouch.push(aC); } }
                   else if (cid === 2) { if (deck.length >= 2) { const top = deck.splice(0, Math.min(3, deck.length)).sort((a, b) => (b.rank || 10) - (a.rank || 10)); deck.unshift(...top); } }
                   else if (cid === 3) { let revP = false; if (target.pouch.length > 0 && !target.mods.pouchImmune) { if (target.pouch[0].rank === 11) { grave.unshift(target.pouch.shift()); revP = true; } } if (!revP && !target.mods.handImmune && target.hand.length > 0) discardSmart(target, grave, 1); }
                   else if (cid === 4) { roundMods.invertTrick = true; }
-                  else if (cid === 5) { const reqS = hS.trumpCard?.suit || 'swords'; for (const o of otherPs) if (!o.mods.handImmune && !o.hand.some(c => c.suit === reqS) && o.hand.length > 0) discardSmart(o, grave, 1); }
+                  else if (cid === 5) { const reqS = getCardSuit(hS.trumpCard) || 'swords'; for (const o of otherPs) if (!o.mods.handImmune && !o.hand.some(c => getCardSuit(c) === reqS) && o.hand.length > 0) discardSmart(o, grave, 1); }
                   else if (cid === 6) { if (p.hand.length > 0 && target.hand.length > 0) { const tmp = p.hand.pop(); p.hand.push(target.hand.pop()); target.hand.push(tmp); } }
                   else if (cid === 7) { roundMods.noTrumpChariot = true; }
                   else if (cid === 8) { roundMods.globalImmunity = true; }
-                  else if (cid === 9) { const gi = grave.findIndex(c => c.type === 'minor'); if (gi !== -1) p.hand.push(grave.splice(gi, 1)[0]); }
+                  else if (cid === 9) { if (grave.length > 0) p.hand.push(grave.shift()); }
                   else if (cid === 10) { const passed = hS.players.map(q => (q.hand.length > 0 ? q.hand.pop() : null)); hS.players.forEach((q, qi) => { const f = (qi - 1 + hS.players.length) % hS.players.length; if (passed[f]) q.hand.push(passed[f]); q.hand.push(...drawN(1)); }); }
                   else if (cid === 11) { const srt = [...hS.players].sort((a, b) => b.hand.length - a.hand.length); if (srt[0].id !== srt[srt.length - 1].id && srt[0].hand.length > 0) srt[srt.length - 1].hand.push(srt[0].hand.pop()); }
                   else if (cid === 12) { discardSmart(p, grave, 2); const mp = p.mods.maxPouch || 3; for (const c of drawN(2)) { if (p.pouch.length < mp) p.pouch.push(c); else p.hand.push(c); } }
                   else if (cid === 13) { for (const q of hS.players) if (q.pouch.length > 0 && !q.mods.pouchImmune) grave.unshift(q.pouch.pop()); }
                   else if (cid === 14) { roundMods.cancelSuitActions = true; }
                   else if (cid === 15) { for (const o of otherPs) { if (o.hand.length > 1 && !o.mods.handImmune) discardSmart(o, grave, 1); else if (o.pouch.length > 0 && !o.mods.pouchImmune) grave.unshift(o.pouch.pop()); } }
-                  else if (cid === 16) { if (hS.trumpCard) grave.unshift(hS.trumpCard); const gi = grave.findIndex(c => c.type === 'minor'); if (gi !== -1) hS.trumpCard = grave.splice(gi, 1)[0]; roundMods.trumpChanged = true; }
+                  else if (cid === 16) { const oldT = hS.trumpCard; if (grave.length > 0) { hS.trumpCard = grave.shift(); if (oldT) grave.unshift(oldT); } roundMods.trumpChanged = true; }
                   else if (cid === 17) { p.hand.push(...drawN(1)); }
                   else if (cid === 18) { const pool = []; const cnts = hS.players.map(q => { const n = q.pouch.length; pool.push(...q.pouch); q.pouch = []; return n; }); hS.players.forEach((q, qi) => { q.pouch = pool.splice(0, cnts[qi]); }); }
                   else if (cid === 19) { p.hand.push(...drawN(1)); if (p.pouch.length < (p.mods.maxPouch || 3) && p.hand.length > 0) p.pouch.push(p.hand.pop()); }
@@ -9253,7 +9259,7 @@ export default function App() {
     reader.onload = (ev) => {
       try {
         const parsed = JSON.parse(String(ev.target?.result || '{}'));
-        const isHardFile = parsed.w2?.length === 50 && parsed.w1?.[0]?.length === 75;
+        const isHardFile = (parsed.w2?.length === 51 || parsed.w2?.length === 50) && (parsed.w1?.[0]?.length === 88 || parsed.w1?.[0]?.length === 75);
         const isEasyFile = parsed.w2?.length === 8 && parsed.w1?.[0]?.length === 16;
         if (!isHardFile && !isEasyFile) {
           setNnBanner({ tone: 'danger', text: 'Invalid weights JSON (expected Easy 16×16×8 or Hard 88×48×51 format).' });
@@ -9450,7 +9456,7 @@ export default function App() {
           {trainRunning && trainProgress.total > 0 && (
             <div className="rounded-xl bg-sky-950/40 border border-sky-500/40 p-3 space-y-1.5">
               <div className="flex justify-between text-xs font-bold text-sky-200">
-                <span>{trainProgress.validating ? `${trainProgress.valStage || 'Validating'}: ${trainProgress.valDone} / ${trainProgress.valTotal} games` : `Training Progress: ${trainProgress.done} / ${trainProgress.total} games ({roundLimit}-rd cap)`}</span>
+                <span>{trainProgress.validating ? `${trainProgress.valStage || 'Validating'}: ${trainProgress.valDone} / ${trainProgress.valTotal} games` : `Training Progress: ${trainProgress.done} / ${trainProgress.total} games (${roundLimit}-rd cap)`}</span>
                 <span>Promotions: {trainProgress.promotions}</span>
               </div>
               <div className="w-full h-2 rounded-full bg-slate-900 overflow-hidden">
@@ -10548,7 +10554,7 @@ export default function App() {
                 </span>
                 {leadSuit && game.phase === 'TRICK' && (
                   <span className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 border border-amber-500/30 text-slate-200 font-semibold">
-                    Lead: <SuitIcon suit={leadSuit} className="w-3.5 h-3.5" /> {SUIT_META[leadSuit].name}
+                    Lead: <SuitIcon suit={leadSuit} className="w-3.5 h-3.5" /> {SUIT_META[leadSuit]?.name || 'Major Arcana'}
                   </span>
                 )}
               </div>
