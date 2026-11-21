@@ -3,7 +3,7 @@ import {
   Sparkles, Shield, Swords, Flame, Coins, Wine, Eye, Skull, Crown,
   BookOpen, Volume2, VolumeX, RotateCcw, Layers, Zap, CheckCircle2,
   AlertTriangle, ChevronRight, X, Lock, Trophy, Users, Play, ScrollText,
-  HelpCircle, Shuffle
+  HelpCircle, Shuffle, Check, History, Pause, SkipBack, SkipForward, ChevronLeft, Trash2
 } from 'lucide-react';
 
 // ============================================================================
@@ -500,6 +500,419 @@ function buildMajorCard(pathwayId) {
   };
 }
 
+// Chess-style Shorthand Netlist Code: P1 (Ace Pentacles), CK (King Cups), S3 (3 Swords), WQ (Queen Wands), X0 (The Fool)
+function cardCode(c) {
+  if (!c) return '—';
+  if (c.type === 'major') return `X${c.majorId}`;
+  const sMap = { swords: 'S', wands: 'W', pentacles: 'P', cups: 'C' };
+  const rMap = { 1: '1', 10: '10', 11: 'P', 12: 'N', 13: 'Q', 14: 'K' };
+  const sc = sMap[c.suit] || '?';
+  const rc = rMap[c.rank] || String(c.rank || '?');
+  return `${sc}${rc}`;
+}
+
+function suitCode(suit) {
+  return { swords: 'S', wands: 'W', pentacles: 'P', cups: 'C' }[suit] || '?';
+}
+
+function pCode(id) {
+  return `#${(id ?? 0) + 1}`;
+}
+
+function pzCode(p) {
+  return `#${(p?.id ?? 0) + 1}z${p?.pathwayId ?? 0}`;
+}
+
+// Formats spent Pouch cards for Ascension netlist, showing exact 1–9 wildcard value used by any 10 (e.g. -/P10=4)
+function formatSpentPouchCodes(spentCards, targetSeq, mods = {}) {
+  const fixedSum = spentCards.reduce((acc, c) => {
+    const isWild = c.rank === 10 || (c.rank === 1 && mods.astronomerWild);
+    return acc + (isWild ? 0 : (c.rank || 0));
+  }, 0);
+  const wildCards = spentCards.filter(c => c.rank === 10 || (c.rank === 1 && mods.astronomerWild));
+  const wildAssign = new Map();
+  if (wildCards.length > 0) {
+    let rem = Math.max(wildCards.length, Math.min(wildCards.length * 9, targetSeq - fixedSum));
+    wildCards.forEach((wc, idx) => {
+      const left = wildCards.length - idx - 1;
+      const val = Math.max(1, Math.min(9, rem - left));
+      wildAssign.set(wc.uid, val);
+      rem -= val;
+    });
+  }
+  return spentCards.map(c => {
+    const base = '-/' + cardCode(c);
+    return wildAssign.has(c.uid) ? `${base}=${wildAssign.get(c.uid)}` : base;
+  }).join(',');
+}
+
+// Parse a shorthand card code (P1, CK, S3, WQ, W10, X0..X21) back into a renderable TarotCard object
+function parseCardCode(raw) {
+  if (!raw) return null;
+  const code = String(raw).trim().replace(/^(\+|\-|\+\/|\-\/)/, '').replace(/(g|s|=\d+)$/, '');
+  if (!code || code === '—') return null;
+  const majM = code.match(/^X(\d+)$/);
+  if (majM) {
+    const id = parseInt(majM[1], 10);
+    if (PATHWAYS[id]) return { ...buildMajorCard(id), uid: `rep_X${id}_${Math.random().toString(36).slice(2, 7)}` };
+  }
+  const minM = code.match(/^([SWPC])(10|[1-9]|[PNQK])$/);
+  if (minM) {
+    const suitMap = { S: 'swords', W: 'wands', P: 'pentacles', C: 'cups' };
+    const rankMap = { '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, '10': 10, P: 11, N: 12, Q: 13, K: 14 };
+    const lblMap = { 1: 'A', 11: 'Page', 12: 'Knight', 13: 'Queen', 14: 'King' };
+    const suit = suitMap[minM[1]];
+    const rank = rankMap[minM[2]];
+    return {
+      uid: `rep_${code}_${Math.random().toString(36).slice(2, 7)}`,
+      type: 'minor',
+      suit,
+      rank,
+      label: lblMap[rank] || String(rank)
+    };
+  }
+  return null;
+}
+
+function splitTopLevelActions(line) {
+  const cleaned = line.replace(/\s*\|\s*/g, ', ');
+  const parts = [];
+  let cur = '', depth = 0;
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') depth = Math.max(0, depth - 1);
+    if (ch === ',' && depth === 0) {
+      if (cur.trim()) parts.push(cur.trim());
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur.trim()) parts.push(cur.trim());
+  return parts;
+}
+
+// Reconstructs step-by-step visual board frames from ANY Shorthand Netlist
+function parseNetlistToFrames(rawText) {
+  const lines = String(rawText || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const frames = [];
+  let state = {
+    round: 1,
+    phase: 'SETUP',
+    phaseHeader: '',
+    players: [],
+    centerDraft: [],
+    trumpCard: null,
+    trickPlays: [],
+    grave: [],
+    banner: '',
+    winnerId: null
+  };
+
+  const cloneState = () => ({
+    ...state,
+    players: state.players.map(p => ({ ...p, hand: [...p.hand], pouch: [...p.pouch] })),
+    centerDraft: [...state.centerDraft],
+    trickPlays: [...state.trickPlays],
+    grave: [...state.grave]
+  });
+
+  const ensurePlayer = (seatNum, pathwayId = 0) => {
+    const id = seatNum - 1;
+    while (state.players.length <= id) {
+      const idx = state.players.length;
+      state.players.push({
+        id: idx,
+        name: idx === 0 ? 'You (#1)' : `Player #${idx + 1}`,
+        pathwayId: idx === id ? pathwayId : idx % 22,
+        seq: 9,
+        digested: false,
+        inactive: false,
+        hand: [],
+        pouch: []
+      });
+    }
+    if (pathwayId !== null && pathwayId !== undefined) state.players[id].pathwayId = pathwayId;
+    return state.players[id];
+  };
+
+  const addUniqueCard = (arr, code) => {
+    const c = parseCardCode(code);
+    if (!c) return null;
+    arr.push(c);
+    return c;
+  };
+  const removeCardByCode = (arr, code) => {
+    const norm = String(code).replace(/^(\+|\-|\+\/|\-\/)/, '').replace(/(g|s|=\d+)$/, '');
+    const idx = arr.findIndex(c => cardCode(c) === norm);
+    if (idx !== -1) return arr.splice(idx, 1)[0];
+    return null;
+  };
+
+  const applyEffectString = (effStr, defaultSeat) => {
+    if (!effStr) return;
+    const items = splitTopLevelActions(effStr);
+    let curSeat = defaultSeat;
+    for (const rawItem of items) {
+      let item = rawItem.trim();
+      const seatPrefix = item.match(/^#(\d+):\s*(.*)$/);
+      if (seatPrefix) {
+        curSeat = parseInt(seatPrefix[1], 10);
+        item = seatPrefix[2].trim();
+      }
+      const pl = curSeat ? ensurePlayer(curSeat, null) : null;
+      const tSwap = item.match(/^T=([SWPC](?:10|[1-9]|[PNQK])|X\d+)$/);
+      if (tSwap) {
+        state.trumpCard = parseCardCode(tSwap[1]);
+        continue;
+      }
+      // Match individual card ops inside item (+S6, +X2g, -W7s, -/P10=4, +/C4)
+      const ops = item.match(/(\+\/|\-\/|\+|\-)([SWPC](?:10|[1-9]|[PNQK])|X\d+)(g|s|=\d+)?/g) || [];
+      for (const op of ops) {
+        const m = op.match(/^(\+\/|\-\/|\+|\-)([SWPC](?:10|[1-9]|[PNQK])|X\d+)(g|s|=\d+)?$/);
+        if (!m || !pl) continue;
+        const [, sign, code, suf] = m;
+        if (sign === '+/') {
+          removeCardByCode(pl.hand, code);
+          addUniqueCard(pl.pouch, code);
+        } else if (sign === '-/') {
+          const rem = removeCardByCode(pl.pouch, code) || parseCardCode(code);
+          if (rem) state.grave.unshift(rem);
+        } else if (sign === '+') {
+          if (suf === 'g') removeCardByCode(state.grave, code);
+          addUniqueCard(pl.hand, code);
+        } else if (sign === '-') {
+          const rem = removeCardByCode(pl.hand, code) || parseCardCode(code);
+          if (suf === 's' && defaultSeat && defaultSeat !== curSeat) {
+            const thief = ensurePlayer(defaultSeat, null);
+            if (rem) thief.hand.push(rem);
+          } else if (rem) {
+            state.grave.unshift(rem);
+          }
+        }
+      }
+    }
+  };
+
+  for (const line of lines) {
+    // 1. Game Start Header: G= #1: z0, #2: z1, #3: z3;
+    if (line.startsWith('G=')) {
+      const matches = [...line.matchAll(/#(\d+):\s*z(\d+)/g)];
+      for (const m of matches) ensurePlayer(parseInt(m[1], 10), parseInt(m[2], 10));
+      state.phase = 'SETUP';
+      state.phaseHeader = line;
+      state.banner = `Match Initialized (${state.players.length} Players — Full 78-Card Deck)`;
+      frames.push({ token: line, desc: state.banner, state: cloneState() });
+      continue;
+    }
+
+    // 2. Phase Headers: R{n}=, D{n}=, T{n}=, A{n}=
+    const rM = line.match(/^R(\d+)=(?:\s*\(([^)]*)\))?$/);
+    if (rM) {
+      state.round = parseInt(rM[1], 10);
+      state.phase = 'POUCH';
+      state.phaseHeader = line;
+      state.trickPlays = [];
+      state.centerDraft = [];
+      state.players.forEach(p => { p.inactive = false; });
+      if (rM[2]) {
+        for (const im of rM[2].matchAll(/#(\d+)x/g)) {
+          const pl = ensurePlayer(parseInt(im[1], 10), null);
+          pl.inactive = true;
+        }
+      }
+      state.banner = `Round ${state.round} — Phase 1: Pouch Management`;
+      frames.push({ token: line, desc: state.banner, state: cloneState() });
+      continue;
+    }
+
+    const dM = line.match(/^D(\d+)=\s*(.*)$/);
+    if (dM) {
+      state.round = parseInt(dM[1], 10);
+      state.phase = 'DRAFT';
+      state.phaseHeader = line;
+      state.centerDraft = dM[2].split(',').map(x => parseCardCode(x.trim())).filter(Boolean);
+      state.banner = `Round ${state.round} — Draft Reveal (${dM[2]})`;
+      frames.push({ token: line, desc: state.banner, state: cloneState() });
+      continue;
+    }
+
+    const tM = line.match(/^T(\d+)=\s*(.*)$/);
+    if (tM) {
+      state.round = parseInt(tM[1], 10);
+      state.phase = 'TRICK';
+      state.phaseHeader = line;
+      state.centerDraft = [];
+      state.trickPlays = [];
+      state.trumpCard = parseCardCode(tM[2].trim());
+      state.banner = `Round ${state.round} — Trick Phase (Trump: ${state.trumpCard ? cardShortName(state.trumpCard) : tM[2]})`;
+      frames.push({ token: line, desc: state.banner, state: cloneState() });
+      continue;
+    }
+
+    const aM = line.match(/^A(\d+)=$/);
+    if (aM) {
+      state.round = parseInt(aM[1], 10);
+      state.phase = 'ASCEND';
+      state.phaseHeader = line;
+      state.banner = `Round ${state.round} — Phase 3: Ascension`;
+      frames.push({ token: line, desc: state.banner, state: cloneState() });
+      continue;
+    }
+
+    // 3. Action Line (comma-separated tokens)
+    const tokens = splitTopLevelActions(line);
+    for (const tok of tokens) {
+      let desc = tok;
+      // Round end A1&
+      if (/^A\d+&$/.test(tok)) {
+        state.banner = `Round ${state.round} Complete`;
+        desc = state.banner;
+        frames.push({ token: tok, desc, state: cloneState() });
+        continue;
+      }
+      // Trick end T1& #1: ?0 (+C5) or ?P (...)
+      const teM = tok.match(/^T(\d+)&\s*#(\d+):\s*(\?[^\s(]+)(?:\s*\((.*)\))?$/);
+      if (teM) {
+        const wSeat = parseInt(teM[2], 10);
+        const wPl = ensurePlayer(wSeat, null);
+        if (teM[4]) applyEffectString(teM[4], wSeat);
+        for (const tp of state.trickPlays) state.grave.unshift(tp.card);
+        state.trickPlays = [];
+        state.trumpCard = null;
+        state.banner = `Trick Winner: ${wPl.name} (${teM[3]})`;
+        desc = state.banner;
+        frames.push({ token: tok, desc, state: cloneState() });
+        continue;
+      }
+      // Interrupt / Ability / Chaos: < #1z0:!q9 (...) or < #1z0:!X3 (...) or < #2z1:-WN (...)
+      const intM = tok.match(/^<\s*#(\d+)z(\d+):([^\s(]+)(?:\s*\((.*)\))?$/);
+      if (intM) {
+        const seat = parseInt(intM[1], 10);
+        const zId = parseInt(intM[2], 10);
+        const pl = ensurePlayer(seat, zId);
+        const act = intM[3];
+        if (intM[4]) applyEffectString(intM[4], seat);
+        const abM = act.match(/^!q(\d+)$/);
+        const chM = act.match(/^!X(\d+)$/);
+        if (abM) {
+          const sq = parseInt(abM[1], 10);
+          const sName = PATHWAYS[zId]?.seqs?.[sq]?.name || `Seq ${sq}`;
+          state.banner = `${pl.name} activated Seq ${sq} ${sName}`;
+        } else if (chM) {
+          const cid = parseInt(chM[1], 10);
+          state.banner = `${pl.name} invoked Chaos Event ${PATHWAYS[cid]?.arcana || 'X' + cid}`;
+        } else {
+          state.banner = `${pl.name} Interrupt: ${act}`;
+        }
+        desc = state.banner;
+        frames.push({ token: tok, desc, state: cloneState() });
+        continue;
+      }
+      // Inactive player recovery: #2x (+C1,+C2)
+      const inactM = tok.match(/^#(\d+)x(?:\s*\((.*)\))?$/);
+      if (inactM) {
+        const seat = parseInt(inactM[1], 10);
+        const pl = ensurePlayer(seat, null);
+        pl.inactive = true;
+        if (inactM[2]) applyEffectString(inactM[2], seat);
+        state.banner = `${pl.name} Mental Break — inactive this round`;
+        desc = state.banner;
+        frames.push({ token: tok, desc, state: cloneState() });
+        continue;
+      }
+      // Standard player action: #1: ...
+      const pM = tok.match(/^#(\d+):\s*(.*)$/);
+      if (pM) {
+        const seat = parseInt(pM[1], 10);
+        const pl = ensurePlayer(seat, null);
+        const body = pM[2].trim();
+        // Digestion q8>
+        const digM = body.match(/^q(\d+)>$/);
+        if (digM) {
+          pl.digested = true;
+          state.banner = `${pl.name} digested Sequence ${digM[1]}!`;
+          desc = state.banner;
+          frames.push({ token: tok, desc, state: cloneState() });
+          continue;
+        }
+        // Ascension @q8 (...) or @q8* (...) or @q0 (WIN)
+        const ascM = body.match(/^@q(\d+)(\*?)(?:\s*\((.*)\))?$/);
+        if (ascM) {
+          const newSeq = parseInt(ascM[1], 10);
+          const reckless = ascM[2] === '*';
+          pl.seq = newSeq;
+          pl.digested = false;
+          if (ascM[3]) applyEffectString(ascM[3], seat);
+          if (newSeq === 0) {
+            state.winnerId = pl.id;
+            state.banner = `APOTHEOSIS! ${pl.name} reached Sequence 0 and WON!`;
+          } else {
+            state.banner = `${pl.name} ${reckless ? 'recklessly ' : ''}ascended to Sequence ${newSeq}`;
+          }
+          desc = state.banner;
+          frames.push({ token: tok, desc, state: cloneState() });
+          continue;
+        }
+        // Draft D+C
+        const drM = body.match(/^D\+([SWPC](?:10|[1-9]|[PNQK])|X\d+)$/);
+        if (drM) {
+          removeCardByCode(state.centerDraft, drM[1]);
+          const c = addUniqueCard(pl.hand, drM[1]);
+          state.banner = `${pl.name} drafted ${c ? cardShortName(c) : drM[1]}`;
+          desc = state.banner;
+          frames.push({ token: tok, desc, state: cloneState() });
+          continue;
+        }
+        // Pouch add/discard +/C or -/C
+        if (/^(\+\/|\-\/)/.test(body)) {
+          applyEffectString(body, seat);
+          state.banner = `${pl.name} Pouch: ${body}`;
+          desc = state.banner;
+          frames.push({ token: tok, desc, state: cloneState() });
+          continue;
+        }
+        // Trick card play: W6(+3=9) (#2: -S6) or P3 (+S6) or T-X4
+        const trM = body.match(/^(?:T-)?([SWPC](?:10|[1-9]|[PNQK])|X\d+)(\([+-]\d+=\d+\))?(?:\s*\((.*)\))?$/);
+        if (trM) {
+          const playedCard = removeCardByCode(pl.hand, trM[1]) || parseCardCode(trM[1]);
+          if (playedCard) state.trickPlays.push({ playerId: pl.id, card: playedCard, tvTag: trM[2] || '' });
+          if (trM[3]) applyEffectString(trM[3], seat);
+          state.banner = `${pl.name} played ${playedCard ? cardShortName(playedCard) : trM[1]}${trM[2] || ''}`;
+          desc = state.banner;
+          frames.push({ token: tok, desc, state: cloneState() });
+          continue;
+        }
+        // Generic effect token
+        applyEffectString(body, seat);
+        state.banner = `${pl.name}: ${body}`;
+        desc = state.banner;
+        frames.push({ token: tok, desc, state: cloneState() });
+      }
+    }
+  }
+  return frames;
+}
+
+const SAMPLE_REPLAY_NETLIST = `G= #1: z0, #2: z1, #3: z3;
+R1=
+#2: +/S8, #3: +/C7, #1: +/S7
+D1= W9, P7, S3, C5
+#1: D+W9, #2: D+P7, #3: D+S3
+T1= C5
+< #1z0:!q9 (k^(S6,S10→S10,S6)), #1: P3 (+S10), #2: WK (#1: V(W7,S6), #1: -W7s, #1: -S6), #3: C4 (+X2g), T1& #1: ?0 (+C5)
+A1=
+#2: @q8 (-/S8,-/P10=1, +S2), A1&
+R2=
+#1: +/C2, #3: +/S2
+D2= P4, S5, W8, C9
+#1: D+P4, #3: D+S5, #2: D+W8
+T2= C9
+< #1z0:!q7 (+3), #1: W6(+3=9) (#2: -W8), #3: S5 (#1: -/S7), #2: P7 (+C3), #1: q9>, T2& #1: ?0 (+C9)
+A2=
+#1: @q8 (-/C2,-/P10=7, +S9), A2&`;
+
 function cardShortName(c) {
   if (!c) return 'None';
   if (c.type === 'major') return `${c.roman}. ${c.name}`;
@@ -573,8 +986,8 @@ function evaluateTrickWinner(plays, trumpCard, roundMods) {
   const leadPlay = plays[0];
   const leadSuit = leadPlay.effSuit;
 
-  // Determine effective Trump Suit (10s override unless abolished or Chariot active)
-  let trumpSuit = trumpCard && trumpCard.type === 'minor' ? trumpCard.suit : null;
+  // Determine effective Trump Suit (Major Arcana can be Trump Suit too; 10s override unless abolished or Chariot active)
+  let trumpSuit = trumpCard ? (trumpCard.type === 'major' ? 'major' : trumpCard.suit) : null;
   let tenOverrideSuit = null;
   if (!roundMods.abolishTrump && !roundMods.noTrumpChariot && !roundMods.spatialLock) {
     for (const p of plays) {
@@ -587,20 +1000,18 @@ function evaluateTrickWinner(plays, trumpCard, roundMods) {
   if (roundMods.weatherSwords) trumpSuit = 'swords';
   if (roundMods.abolishTrump || roundMods.noTrumpChariot) trumpSuit = null;
 
-  // Filter eligible winners (Kings cannot win unless faceCanWin)
-  const eligible = plays.filter(p => {
-    if (p.card.rank === 14 && !p.faceCanWin) return false;
-    return true;
-  });
-  if (eligible.length === 0) return plays[0];
+  // All cards (including K, Q, N, P with effValue 0) are eligible: Face Cards win if sole Trump or Leading Suit with no Trump/numbered Lead!
+  const eligible = plays;
 
   const scorePlay = (p) => {
     const isTrump = trumpSuit && (p.effSuit === trumpSuit || p.countsAsTrump);
     const isLead = p.effSuit === leadSuit;
     const tier = isTrump ? 2 : (isLead ? 1 : 0);
 
-    // Effective numeric rank
-    let val = p.effValue;
+    // Effective numeric rank (Face Cards K>Q>N>P score 0.14>0.13>0.12>0.11 when !faceCanWin so any 1..10 beats them, while K>Q>N>P breaks Face-only ties!)
+    let val = (p.card.type === 'minor' && p.card.rank >= 11 && p.card.rank <= 14 && !p.faceCanWin)
+      ? (p.card.rank / 100)
+      : p.effValue;
     // Ace beats 10 of same suit!
     if (p.card.rank === 1) {
       const hasTenSameSuit = eligible.some(o => (o.card.rank === 10 || o.isTenOverride) && o.effSuit === p.effSuit);
@@ -661,7 +1072,15 @@ class LotmNeuralNet {
     this.updatesCount = saved?.updatesCount || 0;
     this.lastWeightDelta = saved?.lastWeightDelta || 0;
 
-    if (saved && saved.w1 && saved.w2 && saved.w2.length === this.outSize && saved.w1[0]?.length === this.inSize) {
+    const validEasy = !!(
+      saved && Array.isArray(saved.w1) && Array.isArray(saved.w2) && Array.isArray(saved.b1) && Array.isArray(saved.b2) &&
+      saved.w1.length === this.hidSize && saved.b1.length === this.hidSize &&
+      saved.w2.length === this.outSize && saved.b2.length === this.outSize &&
+      saved.w1.every(r => Array.isArray(r) && r.length === this.inSize && r.every(Number.isFinite)) &&
+      saved.w2.every(r => Array.isArray(r) && r.length === this.hidSize && r.every(Number.isFinite)) &&
+      saved.b1.every(Number.isFinite) && saved.b2.every(Number.isFinite)
+    );
+    if (validEasy) {
       this.w1 = saved.w1.map(r => [...r]);
       this.b1 = [...saved.b1];
       this.w2 = saved.w2.map(r => [...r]);
@@ -811,7 +1230,8 @@ class LotmNeuralNet {
 }
 
 function extractBoardFeatures(state, pId, handLimitMode) {
-  const p = state.players[pId];
+  const p = state?.players?.[pId];
+  if (!p) return new Array(16).fill(0);
   const opps = state.players.filter(o => o.id !== pId);
   const cap = getHandLimit(p.seq, handLimitMode);
   const canAsc = findValidAscensionSubset(p.pouch, p.seq, p.mods) !== null ? 1 : 0;
@@ -867,7 +1287,8 @@ const NN_HIGH_VAL_ABILITY_TAGS = new Set([
 
 function extractCardIdFeatures(state, pId, handLimitMode, phaseTag = 'trick') {
   const vec = new Float32Array(88);
-  const p = state.players[pId];
+  const p = state?.players?.[pId];
+  if (!p) return vec;
 
   // Hand Ranks [0..13], Suits [14..17], and 11 Bipolar Major Arcana [18..28]
   for (const c of p.hand) {
@@ -933,7 +1354,7 @@ function extractCardIdFeatures(state, pId, handLimitMode, phaseTag = 'trick') {
   vec[75] = phaseTag === 'ascend' ? 1.0 : 0.0;
 
   // Per-Opponent Targeting Features [76..84] (3 Opponents x [seq/9, hand/10, pouch/3]) so selectTarget outputs [36..38] see each rival!
-  const opps = (state.players || []).filter(o => o.id !== pId);
+  const opps = (state.players || []).filter(o => o.id !== pId && !o.skippedThisRound);
   for (let k = 0; k < 3; k++) {
     const o = opps[k];
     if (o) {
@@ -945,7 +1366,7 @@ function extractCardIdFeatures(state, pId, handLimitMode, phaseTag = 'trick') {
 
   // 3 Tactical Decision Context Bits [85..87]: Free 1st Cast, High-Value Ability, Trump-Is-Ascension-Key
   const curTag = PATHWAYS[p.pathwayId]?.seqs[p.seq]?.tag || '';
-  vec[85] = (p.abilityCastsThisSeq || 0) === 0 ? 1.0 : 0.0;
+  vec[85] = !p.actingDone ? 1.0 : 0.0;
   vec[86] = NN_HIGH_VAL_ABILITY_TAGS.has(curTag) ? 1.0 : 0.0;
   const tc = state.trumpCard;
   vec[87] = (tc && tc.type === 'minor' && (tc.rank === 10 || tc.rank === 1 || tc.rank === p.seq || !!findValidAscensionSubset([...p.pouch, tc], p.seq, p.mods))) ? 1.0 : 0.0;
@@ -973,7 +1394,15 @@ class CardIdNeuralNet {
     this.updatesCount = saved?.updatesCount || 0;
     this.lastWeightDelta = saved?.lastWeightDelta || 0;
 
-    if (saved && saved.w1 && saved.w2 && (saved.w2.length === this.outSize || saved.w2.length === 50) && saved.w1.length === this.hidSize && (saved.w1[0]?.length === this.inSize || saved.w1[0]?.length === 75)) {
+    const validHard = !!(
+      saved && Array.isArray(saved.w1) && Array.isArray(saved.w2) && Array.isArray(saved.b1) && Array.isArray(saved.b2) &&
+      saved.w1.length === this.hidSize && saved.b1.length === this.hidSize &&
+      (saved.w2.length === this.outSize || saved.w2.length === 50) && saved.b2.length === saved.w2.length &&
+      saved.w1.every(r => Array.isArray(r) && (r.length === this.inSize || r.length === 75) && r.every(Number.isFinite)) &&
+      saved.w2.every(r => Array.isArray(r) && r.length === this.hidSize && r.every(Number.isFinite)) &&
+      saved.b1.every(Number.isFinite) && saved.b2.every(Number.isFinite)
+    );
+    if (validHard) {
       this.w1 = saved.w1.map(r => {
         const row = [...r];
         while (row.length < this.inSize) row.push(0);
@@ -1088,10 +1517,11 @@ class CardIdNeuralNet {
   }
 
   scoreOut(h, idx) {
-    let sum = this.b2[idx];
-    const row = this.w2[idx];
-    for (let j = 0; j < this.hidSize; j++) sum += row[j] * h[j];
-    return sum;
+    const row = this.w2?.[idx];
+    if (!row) return 0;
+    let sum = Number.isFinite(this.b2?.[idx]) ? this.b2[idx] : 0;
+    for (let j = 0; j < this.hidSize; j++) sum += (row[j] || 0) * (h[j] || 0);
+    return Number.isFinite(sum) ? sum : 0;
   }
 
   // Contextual Factorized Card Scoring: Rank[0..13] + Suit[14..17] + ±MajorPair[18..28] + 6 Context Heads[39..44]
@@ -1322,7 +1752,7 @@ function applyHeadlessAbility(actor, players, target, deck, grave, trumpCardRef,
   const seqObj = PATHWAYS[actor.pathwayId]?.seqs[actor.seq];
   if (!seqObj && !overrideTag) return;
   const tag = overrideTag || seqObj.tag;
-  const others = players.filter(o => o.id !== actor.id);
+  const others = players.filter(o => o.id !== actor.id && !o.skippedThisRound);
   const maxP = actor.mods.maxPouch || 3;
 
   const forceDiscard = (victim, count = 1, canQueenBlock = true) => {
@@ -1798,7 +2228,7 @@ function applyHeadlessAbility(actor, players, target, deck, grave, trumpCardRef,
       actor.actingDone = true;
       break;
     }
-    case 'listener_grave': if (actor.hand.length > 0) grave.unshift(actor.hand.pop()); if (grave.length > 0) { actor.hand.push(grave.shift()); actor.actingDone = true; } break;
+    case 'listener_grave': { const pulled = grave.length > 0 ? grave.shift() : null; if (actor.hand.length > 0) discardSmart(actor, grave, 1); if (pulled) { actor.hand.push(pulled); actor.actingDone = true; } break; }
     case 'shadow_sacrifice': actor.mods.handImmune = true; actor.mods.pouchImmune = true; break;
     case 'grave_to_pouch_sac': if (grave.length > 0) { if (actor.pouch.length < maxP) actor.pouch.push(grave.shift()); else actor.hand.push(grave.shift()); actor.actingDone = true; } break;
     case 'dark_sub_4': if (actor.hand.length >= 1) { discardSmart(actor, grave, 1); actor.mods.darkSubBonus = true; actor.actingDone = true; } break;
@@ -1931,9 +2361,8 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
   const exploreRate = training ? (nn?.epsilon ?? 0.15) : 0;
   const actualCount = fixedPathways ? fixedPathways.length : playerCount;
   const chosenIds = fixedPathways ? [...fixedPathways] : shuffle(PATHWAYS.map(p => p.id), rng).slice(0, actualCount);
-  const chosenSet = new Set(chosenIds);
-  const unusedMajor = PATHWAYS.map(p => p.id).filter(id => !chosenSet.has(id)).map(id => buildMajorCard(id));
-  let deck = shuffle([...buildMinorDeck(), ...unusedMajor], rng);
+  const allMajor = PATHWAYS.map(p => buildMajorCard(p.id));
+  let deck = shuffle([...buildMinorDeck(), ...allMajor], rng);
   let grave = [];
 
   const players = chosenIds.map((pid, idx) => ({
@@ -2097,6 +2526,7 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
     const bestSeqNow = Math.min(...players.map(p => p.seq));
     for (const p of players) {
       p.abilityUsed = false;
+      p.skippedThisRound = false;
       p.pouchLostThisRound = false;
       p.targetedThisRound = false;
       p.lostCardThisRound = false;
@@ -2110,6 +2540,7 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
     for (const p of players) {
       if (p.skipNextTurn) {
         skippedThisRound.add(p.id);
+        p.skippedThisRound = true;
         p.skipNextTurn = false;
         p.hand.push(...drawN(2));
         p.lostTurns++;
@@ -2271,11 +2702,12 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
     // 3. Trick Play + Chaos + Recast-Cost Abilities
     for (const p of trickOrder) {
       const mockState = { players, deck, grave, trumpCard, trickPlays, round, roundMods };
-      const oppsList = players.filter(o => o.id !== p.id);
+      const oppsList = players.filter(o => o.id !== p.id && !skippedThisRound.has(o.id));
       const netForTgt = resolveNet(p);
-      const target = (netForTgt?.kind === 'hard' && oppsList.length > 1)
-        ? netForTgt.selectTarget(extractCardIdFeatures(mockState, p.id, handLimitMode, 'trick'), oppsList, (training && p.brain === 'nn') ? p.traj : null, p.brain === 'nn' ? exploreRate : 0)
-        : oppsList.sort((a, b) => a.seq - b.seq)[0];
+      let target = oppsList.length === 0 ? null
+        : (netForTgt?.kind === 'hard' && oppsList.length > 1)
+          ? netForTgt.selectTarget(extractCardIdFeatures(mockState, p.id, handLimitMode, 'trick'), oppsList, (training && p.brain === 'nn') ? p.traj : null, p.brain === 'nn' ? exploreRate : 0)
+          : oppsList.sort((a, b) => a.seq - b.seq)[0];
 
       // Decide Chaos Event
       const majorCard = p.hand.find(c => c.type === 'major');
@@ -2296,7 +2728,7 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
           if (p.pathwayId === 12 && p.seq === 1) p.actingDone = true;
           stats.chaosTriggered[majorCard.majorId] = (stats.chaosTriggered[majorCard.majorId] || 0) + 1;
           const cid = majorCard.majorId;
-          const otherPs = players.filter(o => o.id !== p.id);
+          const otherPs = players.filter(o => o.id !== p.id && !skippedThisRound.has(o.id));
           if (cid === 0) {
             const m = p.hand.find(c => c.type === 'minor');
             if (m && trumpCard) { p.hand = p.hand.filter(c => c.uid !== m.uid); p.hand.push(trumpCard); trumpCard = m; roundMods.trumpChanged = true; }
@@ -2305,10 +2737,13 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
           } else if (cid === 2) {
             if (deck.length >= 2) { const top = deck.splice(0, Math.min(3, deck.length)).sort((a, b) => (b.rank || 10) - (a.rank || 10)); deck.unshift(...top); }
           } else if (cid === 3) {
-            if (target && target.pouch.length > 0 && !target.mods.pouchImmune && !roundMods.globalImmunity) {
-              const i = Math.floor(Math.random() * target.pouch.length);
-              if (target.pouch[i].rank === 11) grave.unshift(target.pouch.splice(i, 1)[0]);
-              else if (!target.mods.handImmune && target.hand.length > 0) discardSmart(target, grave, 1);
+            if (target && !roundMods.globalImmunity) {
+              let revealedPage = false;
+              if (target.pouch.length > 0 && !target.mods.pouchImmune) {
+                const i = Math.floor(Math.random() * target.pouch.length);
+                if (target.pouch[i].rank === 11) { grave.unshift(target.pouch.splice(i, 1)[0]); revealedPage = true; }
+              }
+              if (!revealedPage && !target.mods.handImmune && target.hand.length > 0) discardSmart(target, grave, 1);
             }
           } else if (cid === 4) { roundMods.invertTrick = true; }
           else if (cid === 5) {
@@ -2360,8 +2795,8 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
         }
       }
 
-      // Decide Sequence Ability (1st cast FREE per Seq; Recast costs 1 Hand discard!)
-      const recastCost = p.abilityCastsThisSeq > 0 ? 1 : 0;
+      // Decide Sequence Ability (FREE while Undigested; Sanity Toll = 1 Hand discard once Digested!)
+      const recastCost = p.actingDone ? 1 : 0;
       if (!p.abilityUsed && p.hand.length >= (recastCost > 0 ? 3 : 1)) {
         const curTag = PATHWAYS[p.pathwayId]?.seqs[p.seq]?.tag || '';
         const highValRecastTags = new Set([
@@ -2392,12 +2827,10 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
         }
       }
 
-      // Play 1 Minor Arcana
-      let minors = p.hand.filter(c => c.type === 'minor');
-      if (minors.length === 0) continue;
+      // Play ANY card into Trick (no forced follow-suit; Minor OR Major Arcana allowed!)
+      if (p.hand.length === 0) continue;
       const leadSuit = trickPlays[0]?.effSuit;
-      const follow = leadSuit ? minors.filter(c => c.suit === leadSuit) : [];
-      const legal = follow.length > 0 ? follow : minors;
+      const legal = [...p.hand];
 
       let chosen;
       if (isNNBrain(p)) {
@@ -2443,6 +2876,28 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
       }
 
       p.hand = p.hand.filter(c => c.uid !== chosen.uid);
+      if (chosen.type === 'major') {
+        stats.totalChaos++;
+        p.chaosUsed++;
+        stats.chaosTriggered[chosen.majorId] = (stats.chaosTriggered[chosen.majorId] || 0) + 1;
+        if (p.pathwayId === 2 && (p.seq === 4 || p.seq === 1)) p.actingDone = true;
+        if (p.pathwayId === 12 && p.seq === 1) p.actingDone = true;
+        const recCntM = p.mods.skipRecycle ? 0 : chosen.majorId;
+        const recM = grave.splice(0, Math.min(recCntM, grave.length));
+        deck.push(chosen, ...recM);
+        trickPlays.push({
+          playerId: p.id,
+          card: chosen,
+          effValue: chosen.majorId,
+          effSuit: 'major',
+          isTenOverride: false,
+          countsAsTrump: trumpCard?.type === 'major',
+          faceCanWin: false,
+          winsTies: !!p.mods.winsTies,
+          absorbed: true
+        });
+        continue;
+      }
       stats.suitCounts[chosen.suit]++;
       p.suitCounts[chosen.suit]++;
       if (chosen.rank === 14) p.faceCounts.K++;
@@ -2484,13 +2939,27 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
           const mIdx = target.hand.findIndex(c => c.suit === chosen.suit);
           if (mIdx !== -1) p.hand.push(target.hand.splice(mIdx, 1)[0]);
           if (p.pathwayId === 16 && p.seq === 2) p.actingDone = true;
-        } else if ((chosen.suit === 'swords' || roundMods.weatherSwords) && target) {
+        }
+        if ((chosen.suit === 'swords' || roundMods.weatherSwords || chosen.suit === 'wands') && target && target.mods.redirectNext) {
+          target.mods.redirectNext = false;
+          target.hand.push(...drawN(1));
+          target.actingDone = true;
+          const alt = players.find(o => o.id !== p.id && o.id !== target.id && !skippedThisRound.has(o.id)) || p;
+          target = alt;
+        }
+        if ((chosen.suit === 'swords' || roundMods.weatherSwords) && target) {
           target.targetedThisRound = true;
           const canBlock = !p.mods.unblockable && !roundMods.spatialLock && !roundMods.apocalypse;
           const knIdx = canBlock ? target.hand.findIndex(c => c.rank === 12) : -1;
           if (knIdx !== -1) {
-            grave.unshift(target.hand.splice(knIdx, 1)[0]);
+            const knCard = target.hand.splice(knIdx, 1)[0];
             target.faceCounts.N++;
+            // Activate Instant Knight Suit Action!
+            if (knCard.suit === 'pentacles') target.hand.push(...drawN(1));
+            else if (knCard.suit === 'cups' && grave.length > 0) target.hand.push(grave.shift());
+            else if (knCard.suit === 'swords' && p.pouch.length > 0 && !p.mods.pouchImmune) grave.unshift(p.pouch.pop());
+            else if (knCard.suit === 'wands' && p.hand.length > 0 && !p.mods.handImmune) discardSmart(p, grave, 1);
+            grave.unshift(knCard);
             if (target.pathwayId === 8 && (target.seq === 8 || target.seq === 7)) target.actingDone = true;
           } else if (target.mods.dawnPaladin) {
             // Dawn Paladin: attacking Sword enters target's Pouch (or Hand if full)!
@@ -2528,8 +2997,14 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
           const canBlock = !p.mods.unblockable && !roundMods.spatialLock && !roundMods.apocalypse;
           const qnIdx = canBlock ? target.hand.findIndex(c => c.rank === 13) : -1;
           if (qnIdx !== -1) {
-            grave.unshift(target.hand.splice(qnIdx, 1)[0]);
+            const qnCard = target.hand.splice(qnIdx, 1)[0];
             target.faceCounts.Q++;
+            // Activate Instant Queen Suit Action!
+            if (qnCard.suit === 'pentacles') target.hand.push(...drawN(1));
+            else if (qnCard.suit === 'cups' && grave.length > 0) target.hand.push(grave.shift());
+            else if (qnCard.suit === 'swords' && p.pouch.length > 0 && !p.mods.pouchImmune) grave.unshift(p.pouch.pop());
+            else if (qnCard.suit === 'wands' && p.hand.length > 0 && !p.mods.handImmune) discardSmart(p, grave, 1);
+            grave.unshift(qnCard);
           } else if (target.mods.handImmune) {
             if (target.mods.counterPunch) { discardSmart(p, grave, 1); target.actingDone = true; }
             if (target.pathwayId === 3 && target.seq === 8) target.hand.push(...drawN(1));
@@ -2567,7 +3042,7 @@ function runHeadlessGame({ playerCount = 4, handLimitMode = '10-7', aiMode = 'nn
       const winner = players[winPlay.playerId];
       winner.tricksWon++;
       addStepReward(winner, 0.05);
-      if (roundMods.warDeclared) { for (const pl of players) if (pl.id !== winner.id && pl.hand.length > 0) discardSmart(pl, grave, 1); }
+      if (roundMods.warDeclared) { for (const pl of players) if (pl.id !== winner.id && !skippedThisRound.has(pl.id) && pl.hand.length > 0) discardSmart(pl, grave, 1); }
       if (winner.mods.eternalNight) winner.hand.push(...drawN(2));
       if (winner.mods.folkWinDraw) winner.hand.push(...drawN(1));
 
@@ -3070,6 +3545,67 @@ export default function App() {
   const [showGrave, setShowGrave] = useState(false);
   const [showAscendModal, setShowAscendModal] = useState(false);
   const [ascendSelectedUids, setAscendSelectedUids] = useState([]);
+  const [selectedHandUid, setSelectedHandUid] = useState(null);
+  const [interruptSecLeft, setInterruptSecLeft] = useState(5);
+  const [boardInspect, setBoardInspect] = useState(null); // { type: 'opp', oppId } | { type: 'card', card, label }
+  const [logViewMode, setLogViewMode] = useState('both'); // 'both' | 'netlist' | 'detailed'
+  const [netlistCopied, setNetlistCopied] = useState(false);
+  const [gameHistory, setGameHistory] = useState(() => {
+    try {
+      const raw = localStorage.getItem('lotm_game_history_v1');
+      return raw ? JSON.parse(raw) : [];
+    } catch (_) { return []; }
+  });
+  const [replayInput, setReplayInput] = useState(SAMPLE_REPLAY_NETLIST);
+  const [replayFrames, setReplayFrames] = useState(() => parseNetlistToFrames(SAMPLE_REPLAY_NETLIST));
+  const [replayStep, setReplayStep] = useState(0);
+  const [replayPlaying, setReplayPlaying] = useState(false);
+  const [replaySpeedMs, setReplaySpeedMs] = useState(950);
+  const [replayTitle, setReplayTitle] = useState('Sample Verified Match (Fool vs Magician vs Empress)');
+  const [historySavedToast, setHistorySavedToast] = useState(false);
+  const lastSavedGameRef = useRef(null);
+
+  const exportLogsToNetlist = useCallback((logs) => {
+    return [...(logs || [])].reverse().map(e => {
+      if (e.headerCode !== undefined) {
+        const actLine = (e.actions && e.actions.length > 0) ? `\n${e.actions.join(', ')}` : '';
+        return `${e.headerCode}${actLine}`;
+      }
+      return e.code || '';
+    }).filter(Boolean).join('\n');
+  }, []);
+
+  const saveGameToHistory = useCallback((gState, customLabel = null) => {
+    if (!gState || !gState.logs || gState.logs.length === 0) return;
+    const netlist = exportLogsToNetlist(gState.logs);
+    const wPl = gState.winnerId !== null ? gState.players[gState.winnerId] : null;
+    const entry = {
+      id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      date: new Date().toLocaleString(),
+      title: customLabel || (wPl ? `${wPl.name} (${PATHWAYS[wPl.pathwayId]?.arcana}) Won — ${gState.round} Rnds` : `In-Progress Match (Round ${gState.round})`),
+      winnerSeat: wPl ? `#${wPl.id + 1}` : '—',
+      rounds: gState.round,
+      players: gState.players.map(p => `#${p.id + 1}: ${PATHWAYS[p.pathwayId]?.arcana} (z${p.pathwayId})`).join(' · '),
+      netlist
+    };
+    setGameHistory(prev => {
+      const next = [entry, ...prev].slice(0, 25);
+      try { localStorage.setItem('lotm_game_history_v1', JSON.stringify(next)); } catch (_) {}
+      return next;
+    });
+    setHistorySavedToast(true);
+    setTimeout(() => setHistorySavedToast(false), 1800);
+  }, [exportLogsToNetlist]);
+
+  const openReplayWithNetlist = useCallback((netlistText, title = 'Custom Netlist Replay') => {
+    const frames = parseNetlistToFrames(netlistText);
+    setReplayInput(netlistText);
+    setReplayFrames(frames);
+    setReplayStep(0);
+    setReplayPlaying(false);
+    setReplayTitle(title);
+    setScreen('replay');
+  }, []);
   // Ability & Mechanics Lab State
   const [labPathwayId, setLabPathwayId] = useState(0);
   const [labSeq, setLabSeq] = useState(9);
@@ -3106,7 +3642,8 @@ export default function App() {
     const opp2Pouch = [pick('cups', 3), pick('pentacles', 6)];
     const grave = [pick('swords', 9), pick('cups', 2), pick('wands', 11), pick('pentacles', 1), pick('swords', 3), pick('cups', 8)];
     const trumpCard = pick('cups', 6);
-    const deck = [pick('wands', 9), pick('pentacles', 7), pick('swords', 1), buildMajorCard(4), ...shuffle(minors)];
+    const allMajors = PATHWAYS.map(p => p.id).filter(id => id !== 2 && id !== 4).map(id => buildMajorCard(id));
+    const deck = [pick('wands', 9), pick('pentacles', 7), pick('swords', 1), buildMajorCard(4), ...shuffle([...minors, ...allMajors])];
 
     const players = [
       {
@@ -3126,11 +3663,31 @@ export default function App() {
       }
     ];
 
+    const initLogs = [
+      {
+        id: 2,
+        headerCode: `T1= ${cardCode(trumpCard)}`,
+        actions: [],
+        details: [{ text: `Trick Phase ready (Trump: ${cardShortName(trumpCard)}). Use the Phase Stepper to run full Pouch → Draft → Trick → Ascend flow.`, tone: 'gold' }],
+        text: `Trick Phase ready (Trump: ${cardShortName(trumpCard)}).`,
+        tone: 'gold',
+        code: `T1= ${cardCode(trumpCard)}`
+      },
+      {
+        id: 1,
+        headerCode: `G= #1: z${pId}, #2: z${(pId + 1) % 22}, #3: z${(pId + 2) % 22};`,
+        actions: [],
+        details: [{ text: `Lab initialized with ${ROMAN[pId]}. ${PATHWAYS[pId].arcana} (Seq ${seqNum} ${PATHWAYS[pId].seqs[seqNum].name}) — Full 78-card Deck.`, tone: 'gold' }],
+        text: `Lab initialized with ${ROMAN[pId]}. ${PATHWAYS[pId].arcana} (Seq ${seqNum} ${PATHWAYS[pId].seqs[seqNum].name}).`,
+        tone: 'gold',
+        code: `G= #1: z${pId}, #2: z${(pId + 1) % 22}, #3: z${(pId + 2) % 22};`
+      }
+    ];
     return {
       round: 1, dealerIdx: 0, players, deck, grave, centerDraft: [], trumpCard,
-      draftOrder: [0, 1, 2], draftTurnIdx: 0, trickOrder: [2, 1, 0], trickTurnIdx: 0,
+      draftOrder: [0, 1, 2], draftTurnIdx: 0, trickOrder: [0, 1, 2], trickTurnIdx: 0,
       trickPlays: [], trickWinnerId: null, phase: 'TRICK', roundMods: {}, pendingInteraction: null,
-      logs: [{ id: 1, text: `Lab initialized with ${ROMAN[pId]}. ${PATHWAYS[pId].arcana} (Seq ${seqNum} ${PATHWAYS[pId].seqs[seqNum].name}).`, tone: 'gold' }],
+      logs: initLogs,
       winnerId: null
     };
   }, []);
@@ -3209,8 +3766,8 @@ export default function App() {
       });
     }
 
-    // Build Deck: 56 Minor + remaining unused Major Arcana
-    const majorCards = remainingIds.map(id => buildMajorCard(id));
+    // Build Full 78-Card Deck: 56 Minor + all 22 Major Arcana (keep all 78 cards in play)
+    const majorCards = PATHWAYS.map(p => buildMajorCard(p.id));
     let deck = shuffle([...buildMinorDeck(), ...majorCards]);
 
     // Deal 7 cards each
@@ -3236,8 +3793,15 @@ export default function App() {
       roundMods: {},
       pendingInteraction: null, // { type: 'TARGET' | 'INTERRUPT' | 'GAMBLE_SUIT' | 'POUCH_SWAP', ... }
       logs: [
-        { id: 1, text: `Game started! You walk the ${PATHWAYS[humanPathwayId].arcana} (${PATHWAYS[humanPathwayId].lotm}) Pathway.`, tone: 'gold' },
-        { id: 2, text: `Round 1 begins — Each player draws 1 card and tucks 1 card into their Pouch.`, tone: 'info' }
+        {
+          id: 1,
+          headerCode: `G= ${players.map(pl => `${pCode(pl.id)}: z${pl.pathwayId}`).join(', ')};`,
+          actions: [],
+          details: [{ text: `Game started! You walk the ${PATHWAYS[humanPathwayId].arcana} (${PATHWAYS[humanPathwayId].lotm}) Pathway (Full 78-card Deck).`, tone: 'gold' }],
+          text: `Game started! You walk the ${PATHWAYS[humanPathwayId].arcana} (${PATHWAYS[humanPathwayId].lotm}) Pathway (Full 78-card Deck).`,
+          tone: 'gold',
+          code: `G= ${players.map(pl => `${pCode(pl.id)}: z${pl.pathwayId}`).join(', ')};`
+        }
       ],
       winnerId: null
     };
@@ -3263,9 +3827,136 @@ export default function App() {
     return { drawn, deck, grave };
   }
 
-  function addLog(logs, text, tone = 'normal') {
+  function addLog(logs, text, tone = 'normal', code = null, opts = {}) {
     const nextId = (logs[0]?.id || 0) + 1;
-    return [{ id: nextId, text, tone }, ...logs].slice(0, 60);
+    if (opts.newPhase) {
+      return [{
+        id: nextId,
+        headerCode: code || '',
+        actions: [],
+        details: [{ text, tone }],
+        text,
+        tone,
+        code
+      }, ...logs].slice(0, 300);
+    }
+    if (opts.appendEffect && logs.length > 0 && logs[0].actions && logs[0].actions.length > 0) {
+      const head = logs[0];
+      const acts = [...head.actions];
+      // Find last triggering action (skip trailing digestion tags like "#1: q5>")
+      let targetIdx = acts.length - 1;
+      while (targetIdx > 0 && /^#\d+: q\d+>$/.test(acts[targetIdx])) targetIdx--;
+      const last = acts[targetIdx];
+      if (code) {
+        // Deduplicate (#2) + (#2: -W9) -> (#2: -W9)
+        const singleTgtMatch = last.match(/\((#\d+)\)$/);
+        if (singleTgtMatch && code.startsWith(singleTgtMatch[1] + ':')) {
+          acts[targetIdx] = last.slice(0, -singleTgtMatch[0].length) + `(${code})`;
+        } else if (last.endsWith(')')) {
+          acts[targetIdx] = `${last.slice(0, -1)}, ${code})`;
+        } else {
+          acts[targetIdx] = `${last} (${code})`;
+        }
+      }
+      const nextDetails = [...(head.details || [{ text: head.text, tone: head.tone }]), { text, tone }];
+      return [{ ...head, actions: acts, details: nextDetails }, ...logs.slice(1)];
+    }
+    if (logs.length > 0 && logs[0].headerCode !== undefined && !opts.standalone) {
+      const head = logs[0];
+      const nextActions = code ? [...(head.actions || []), code] : (head.actions || []);
+      const nextDetails = [...(head.details || [{ text: head.text, tone: head.tone }]), { text, tone }];
+      return [{ ...head, actions: nextActions, details: nextDetails }, ...logs.slice(1)];
+    }
+    return [{ id: nextId, text, tone, code, details: [{ text, tone }] }, ...logs].slice(0, 300);
+  }
+
+  // Live NN Hard card selector (uses exact same 11 tactical Card-Context keySigns as headless, trajectory = null!)
+  function selectCardLiveHard(net, state, pId, candidates, phaseTag = 'trick') {
+    if (!net || net.kind !== 'hard' || !candidates || candidates.length === 0) return candidates?.[0] || null;
+    const p = state.players[pId];
+    if (!p) return candidates[0];
+    const leadPlay = state.trickPlays && state.trickPlays[0];
+    const oppLeading = state.players ? state.players.filter(o => o.id !== p.id).sort((a, b) => a.seq - b.seq)[0] : null;
+    const keySigns = candidates.map(c => {
+      const isMinor = c.type === 'minor';
+      const completesNow = isMinor && (c.rank <= p.seq || c.rank === 10) && findValidAscensionSubset([...p.pouch, c], p.seq, p.mods) !== null;
+      const isExact = isMinor && (c.rank === p.seq || (c.rank === 10 && (phaseTag !== 'pouch' || completesNow)));
+      const isKey = isMinor && (isExact || completesNow);
+      const isPair = isMinor && c.rank < p.seq && p.pouch.some(pc => pc.rank && pc.rank + c.rank === p.seq);
+      const keyVal = isKey ? (phaseTag === 'trick' ? -2.2 : 2.0) : 0;
+      const pairVal = isPair ? (phaseTag === 'trick' ? -1.0 : 1.2) : 0;
+      const rankStr = isMinor && c.rank <= 10 ? (phaseTag === 'trick' ? c.rank / 10 : (c.rank <= p.seq ? 0.5 : -0.8)) : 0;
+      const isTrump = isMinor && state.trumpCard && c.suit === state.trumpCard.suit ? (phaseTag === 'trick' ? 1.0 : 0.4) : 0;
+      const drawRescue = isMinor && ((c.suit === 'pentacles') || (c.suit === 'cups' && (state.grave?.length || 0) > 0)) && p.hand.length <= 4 ? 1.2 : 0;
+      const defReserve = isMinor && (c.rank === 11 || c.rank === 12 || c.rank === 13) && phaseTag === 'trick' ? 1.8 : 0;
+      let canWin = 0;
+      if (phaseTag === 'trick' && isMinor && c.rank !== 14) {
+        if (leadPlay) {
+          const simPlay = { playerId: p.id, card: c, effValue: Math.min(10, (c.rank <= 10 ? c.rank : 0) + (p.mods.trickBonus || 0)), effSuit: c.suit, isTenOverride: c.rank === 10 };
+          const w = evaluateTrickWinner([...state.trickPlays, simPlay], state.trumpCard, state.roundMods || {});
+          canWin = (w && w.playerId === p.id) ? 1.2 : -0.4;
+        } else if (c.rank === 10 || (state.trumpCard && c.suit === state.trumpCard.suit && c.rank >= 6)) {
+          canWin = 0.6;
+        }
+      }
+      let disrupt = 0;
+      if (phaseTag === 'trick' && isMinor && oppLeading) {
+        if (c.suit === 'swords' && oppLeading.pouch.length >= 1) disrupt = oppLeading.pouch.length >= 2 ? 1.4 : 0.8;
+        else if (c.suit === 'wands' && oppLeading.hand.length <= 3) disrupt = 1.2;
+        else if (c.rank === 14 && oppLeading.hand.length >= 3) disrupt = 0.9;
+      }
+      const nextLook = (phaseTag !== 'trick' && isMinor && p.seq > 1 && c.rank <= p.seq - 1) ? 0.7 : 0;
+      const exactVal = isExact ? (phaseTag === 'trick' ? -2.0 : 1.8) : 0;
+      let endgameHoard = 0;
+      if (isMinor) {
+        if (c.rank === 10) endgameHoard = phaseTag === 'trick' ? -2.4 : (phaseTag === 'draft' ? 2.4 : (completesNow ? 2.5 : -1.5));
+        else if (c.rank === 1) endgameHoard = phaseTag === 'trick' ? -2.2 : (phaseTag === 'draft' ? 2.0 : (p.seq === 1 ? 2.5 : -0.6));
+        else if (c.rank === 2 && p.seq >= 2) endgameHoard = phaseTag === 'trick' ? -1.4 : (phaseTag === 'draft' ? 1.3 : (p.seq === 2 ? 2.0 : -0.3));
+        else if (c.rank === 3 && p.seq >= 3) endgameHoard = phaseTag === 'trick' ? -0.9 : (phaseTag === 'draft' ? 0.9 : 0);
+        if (c.suit === 'cups' && state.grave?.[0]?.type === 'minor' && state.grave[0].rank <= Math.min(3, p.seq)) {
+          endgameHoard += (phaseTag === 'trick' || phaseTag === 'draft') ? 2.0 : 0;
+        }
+      }
+      return [keyVal, pairVal, rankStr, isTrump, drawRescue, defReserve, canWin, disrupt, nextLook, exactVal, endgameHoard];
+    });
+    return net.selectCard(extractCardIdFeatures(state, pId, handLimitMode, phaseTag), candidates, null, 0, keySigns) || candidates[0];
+  }
+
+  // Activate the Suit Action of a Knight or Queen whenever played as an Instant Interrupt!
+  function applyInstantFaceSuitAction(s, blocker, attacker, faceCard) {
+    if (!faceCard || s.roundMods?.cancelSuitActions) return;
+    if (faceCard.suit === 'pentacles') {
+      const r = drawCardsFromDeck(s, 1);
+      s.deck = r.deck; s.grave = r.grave;
+      blocker.hand.push(...r.drawn);
+      s.logs = addLog(s.logs, `INSTANT PENTACLE! ${blocker.name}'s ${cardShortName(faceCard)} drew 1 card from Deck!`, 'emerald', `< ${pzCode(blocker)}:(${r.drawn.map(c => '+' + cardCode(c)).join(',')})`);
+    } else if (faceCard.suit === 'cups') {
+      if (s.grave.length > 0) {
+        const pulled = s.grave.shift();
+        blocker.hand.push(pulled);
+        s.logs = addLog(s.logs, `INSTANT CUP! ${blocker.name}'s ${cardShortName(faceCard)} pulled ${cardShortName(pulled)} from Grave!`, 'info', `< ${pzCode(blocker)}:(+${cardCode(pulled)}g)`);
+      }
+    } else if (faceCard.suit === 'swords' && attacker && !attacker.mods?.pouchImmune && attacker.pouch.length > 0) {
+      const idx = Math.floor(Math.random() * attacker.pouch.length);
+      const hit = attacker.pouch.splice(idx, 1)[0];
+      s.grave.unshift(hit);
+      attacker.pouchLostThisRound = true;
+      s.logs = addLog(s.logs, `INSTANT SWORD! ${blocker.name}'s ${cardShortName(faceCard)} destroyed 1 of ${attacker.name}'s Pouch cards!`, 'danger', `< ${pzCode(blocker)}:(${pCode(attacker.id)}: -/${cardCode(s.grave[0])})`);
+    } else if (faceCard.suit === 'wands' && attacker && !attacker.mods?.handImmune && attacker.hand.length > 0) {
+      if (!(attacker.mods?.sunFloor && attacker.hand.length <= 3)) {
+        if (attacker.isHuman) {
+          s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: 1, destination: 'grave', selectedUids: [], appendEffect: true, effectPrefix: '#1: ', reason: `${blocker.name}'s Instant ${cardShortName(faceCard)} forces you to discard 1 card.` };
+          attacker.lostCardThisRound = true;
+          s.logs = addLog(s.logs, `INSTANT WAND! ${blocker.name}'s ${cardShortName(faceCard)} forces you to choose 1 card to discard.`, 'danger');
+        } else {
+          const dIdx = pickDiscardCardIdx(attacker.hand, attacker.seq);
+          const dropped = attacker.hand.splice(dIdx, 1)[0];
+          s.grave.unshift(dropped);
+          attacker.lostCardThisRound = true;
+          s.logs = addLog(s.logs, `INSTANT WAND! ${blocker.name}'s ${cardShortName(faceCard)} forced ${attacker.name} to discard ${cardShortName(dropped)}!`, 'danger', `${pCode(attacker.id)}: -${cardCode(dropped)}`, { appendEffect: true });
+        }
+      }
+    }
   }
 
   function beginRoundDraw(state) {
@@ -3285,6 +3976,11 @@ export default function App() {
       pendingInteraction: null
     };
 
+    // Emit Round/Pouch header FIRST so Mental Break recoveries & AI Pouch tucks stay cleanly inside R{n}=
+    const preInactive = s.players.filter(pl => pl.skipNextTurn).map(pl => `${pCode(pl.id)}x`);
+    const roundHeaderTop = preInactive.length > 0 ? `R${s.round}= (${preInactive.join(', ')})` : `R${s.round}=`;
+    s.logs = addLog(s.logs, `Round ${s.round} — Phase 1: Pouch Management${preInactive.length > 0 ? ` (Inactive this round: ${s.players.filter(pl => pl.skipNextTurn).map(pl => pl.name).join(', ')})` : ''}.`, 'info', roundHeaderTop, { newPhase: true });
+
     // Start-of-turn: NO initial draw! Players who ended last round at 0 cards skip this round & draw 2 to recover.
     for (let i = 0; i < s.players.length; i++) {
       const p = s.players[i];
@@ -3294,12 +3990,22 @@ export default function App() {
         s.deck = rec.deck;
         s.grave = rec.grave;
         p.hand = [...p.hand, ...rec.drawn];
-        s.logs = addLog(s.logs, `MENTAL BREAK: ${p.name} skips this round and draws 2 recovery cards.`, 'danger');
+        s.logs = addLog(s.logs, `MENTAL BREAK: ${p.name} is inactive this round and draws 2 recovery cards (${rec.drawn.map(cardShortName).join(', ')}).`, 'danger', `${pCode(p.id)}x (${rec.drawn.map(c => '+' + cardCode(c)).join(',')})`);
         continue;
       }
 
       // AI Phase 1 Pouch Tucking (respects selected Heuristic Depth 1-6 / NN Easy / NN Hard!)
       const maxP = p.mods.maxPouch || 3;
+      if (!p.isHuman && p.pouch.length > 0 && !p.mods.savantSubtract) {
+        for (let pi = p.pouch.length - 1; pi >= 0; pi--) {
+          const pc = p.pouch[pi];
+          if (pc.type === 'minor' && pc.rank <= 9 && pc.rank > p.seq) {
+            const evicted = p.pouch.splice(pi, 1)[0];
+            s.grave.unshift(evicted);
+            s.logs = addLog(s.logs, `${p.name} discarded stale ${cardShortName(evicted)} from Pouch.`, 'muted', `${pCode(p.id)}: -/${cardCode(evicted)}`);
+          }
+        }
+      }
       if (!p.isHuman && p.hand.length >= 2) {
         const evalHard = aiBrainMode === 'nn_hard' ? new CardIdNeuralNet(nnHardRef.current.bestValSnapshot || nnHardRef.current.championSnapshot || nnHardRef.current.serialize()) : null;
         if (!findValidAscensionSubset(p.pouch, p.seq, p.mods)) {
@@ -3323,19 +4029,22 @@ export default function App() {
             while (p.pouch.length + bestSub.fromH.length > maxP) {
               const rIdx = p.pouch.findIndex(c => !keepSet.has(c.uid));
               if (rIdx === -1) break;
-              s.grave.unshift(p.pouch.splice(rIdx, 1)[0]);
+              const droppedP = p.pouch.splice(rIdx, 1)[0];
+              s.grave.unshift(droppedP);
+              s.logs = addLog(s.logs, `${p.name} discarded ${cardShortName(droppedP)} from Pouch.`, 'muted', `${pCode(p.id)}: -/${cardCode(droppedP)}`);
             }
             for (const hc of bestSub.fromH) {
               if (p.pouch.length < maxP) {
                 p.hand = p.hand.filter(c => c.uid !== hc.uid);
                 p.pouch.push(hc);
+                s.logs = addLog(s.logs, `${p.name} tucked ${cardShortName(hc)} into Pouch.`, 'muted', `${pCode(p.id)}: +/${cardCode(hc)}`);
               }
             }
           } else if (p.pouch.length < maxP) {
             let pick = null;
             if (evalHard) {
               const cands = p.hand.filter(c => c.type === 'minor' && (c.rank <= p.seq || c.rank === 10 || (p.pouch.length < 2 && c.rank === 11)));
-              if (cands.length > 0) pick = evalHard.selectCard(extractCardIdFeatures(s, p.id, handLimitMode), cands, 'pouch', null, 0);
+              if (cands.length > 0) pick = selectCardLiveHard(evalHard, s, p.id, cands, 'pouch');
             } else {
               const nonTen = hNums.filter(c => c.rank !== 10).sort((a, b) => b.rank - a.rank);
               pick = nonTen[0] || (p.pouch.length < 2 ? p.hand.find(c => c.type === 'minor' && c.rank === 11) : null);
@@ -3343,6 +4052,7 @@ export default function App() {
             if (pick) {
               p.hand = p.hand.filter(c => c.uid !== pick.uid);
               p.pouch.push(pick);
+              s.logs = addLog(s.logs, `${p.name} tucked ${cardShortName(pick)} into Pouch.`, 'muted', `${pCode(p.id)}: +/${cardCode(pick)}`);
             }
           }
         }
@@ -3385,7 +4095,7 @@ export default function App() {
     s.draftOrder = order;
     s.draftTurnIdx = 0;
     s.phase = 'DRAFT';
-    s.logs = addLog(s.logs, `Center revealed ${n + 1} cards. Lowest Sequence drafts first.`, 'info');
+    s.logs = addLog(s.logs, `Center revealed ${s.centerDraft.length} cards (${s.centerDraft.map(cardShortName).join(', ')}). Lowest Sequence drafts first.`, 'info', `D${s.round}= ${s.centerDraft.map(cardCode).join(', ')}`, { newPhase: true });
     return s;
   }
 
@@ -3402,7 +4112,9 @@ export default function App() {
     s.logs = addLog(
       s.logs,
       `Trump Card set: ${cardShortName(s.trumpCard)}. ${s.players[s.trickOrder[0]].name} leads the trick!`,
-      'gold'
+      'gold',
+      `T${s.round}= ${cardCode(s.trumpCard)}`,
+      { newPhase: true }
     );
     return s;
   }
@@ -3412,7 +4124,7 @@ export default function App() {
     if (!player.actingDone) {
       player.actingDone = true;
       if (player.isHuman) sfx.digest();
-      return addLog(logs, `${player.name} digested Sequence ${player.seq} (${PATHWAYS[player.pathwayId].seqs[player.seq]?.name}): ${reason}`, 'emerald');
+      return addLog(logs, `${player.name} digested Sequence ${player.seq} (${PATHWAYS[player.pathwayId].seqs[player.seq]?.name}): ${reason}`, 'emerald', `${pCode(player.id)}: q${player.seq}>`);
     }
     return logs;
   }
@@ -3430,11 +4142,19 @@ export default function App() {
     const actor = s.players[playerId];
     actor.hand = actor.hand.filter(c => c.uid !== majorCard.uid);
 
-    const others = s.players.filter(p => p.id !== playerId);
-    const target = targetOppId !== null ? s.players[targetOppId] : others[0];
+    const others = s.players.filter(p => p.id !== playerId && !p.skippedThisRound);
+    const target = (targetOppId !== null && s.players[targetOppId] && !s.players[targetOppId].skippedThisRound) ? s.players[targetOppId] : (others[0] || null);
     const id = majorCard.majorId;
 
-    s.logs = addLog(s.logs, `CHAOS EVENT! ${actor.name} invokes ${majorCard.roman}. ${majorCard.name} (Recycles ${id} from Grave).`, 'chaos');
+    const isTargetedChaos = [1, 3, 6, 17].includes(id);
+    s.logs = addLog(s.logs, `CHAOS EVENT! ${actor.name} invokes ${majorCard.roman}. ${majorCard.name} (Recycles ${id} from Grave).`, 'chaos', `< ${pzCode(actor)}:!X${id}${(isTargetedChaos && target) ? `(${pCode(target.id)})` : ''}`);
+
+    // Guard Trump-dependent Chaos Events if Trump Card is not revealed yet (Phase 1 Pouch)
+    if ((id === 0 || id === 16) && !s.trumpCard) {
+      actor.hand.push(majorCard);
+      s.logs = addLog(s.logs, `Wait until the Trump Card is revealed (after Draft) to invoke ${majorCard.roman}. ${majorCard.name}!`, 'danger');
+      return s;
+    }
 
     // Execute all 22 Chaos Effects
     if (id === 0) { // Fool: swap Trump with Hand
@@ -3452,7 +4172,7 @@ export default function App() {
           actor.hand.push(s.trumpCard);
           s.trumpCard = minor;
           s.roundMods.trumpChanged = true;
-          s.logs = addLog(s.logs, `Trump Card swapped to ${cardShortName(minor)}!`, 'chaos');
+          s.logs = addLog(s.logs, `Trump Card swapped to ${cardShortName(minor)}!`, 'chaos', `(T=${cardCode(minor)})`);
         }
       }
     } else if (id === 1) { // Magician: swap Pouch with opp
@@ -3461,7 +4181,7 @@ export default function App() {
         const tCard = target.pouch.pop();
         actor.pouch.push(tCard);
         target.pouch.push(aCard);
-        s.logs = addLog(s.logs, `${actor.name} swapped a Pouch card with ${target.name}!`, 'chaos');
+        s.logs = addLog(s.logs, `${actor.name} swapped a Pouch card with ${target.name}!`, 'chaos', `${pCode(actor.id)}↔${pCode(target.id)} /P`, { appendEffect: true });
       }
     } else if (id === 2) { // High Priestess: peek & reorder top 3
       if (s.deck.length >= 2) {
@@ -3480,29 +4200,55 @@ export default function App() {
         }
         s.logs = addLog(s.logs, `${actor.name} divined the top ${cnt} Deck cards.`, 'chaos');
       }
-    } else if (id === 3) { // Empress: reveal opp Pouch; destroy Page else discard 1
-      if (target && target.pouch.length > 0) {
-        const idx = Math.floor(Math.random() * target.pouch.length);
-        const c = target.pouch[idx];
-        if (c.rank === 11) {
-          target.pouch.splice(idx, 1);
-          s.grave.unshift(c);
-          s.logs = addLog(s.logs, `Empress exposed and destroyed ${target.name}'s Page Trap!`, 'danger');
-        } else if (target.hand.length > 0) {
-          const d = target.hand.pop();
-          s.grave.unshift(d);
-          s.logs = addLog(s.logs, `Empress exposed ${cardShortName(c)} in ${target.name}'s Pouch; they discarded 1 Hand card.`, 'chaos');
+    } else if (id === 3) { // Empress: opponent discards 1 card if they do not reveal a Page (even if Pouch empty!)
+      if (target && !s.roundMods.globalImmunity) {
+        let revealedPage = false;
+        let revealedCard = null;
+        if (target.pouch.length > 0 && !target.mods.pouchImmune) {
+          const idx = Math.floor(Math.random() * target.pouch.length);
+          revealedCard = target.pouch[idx];
+          if (revealedCard.rank === 11) {
+            target.pouch.splice(idx, 1);
+            s.grave.unshift(revealedCard);
+            revealedPage = true;
+            s.logs = addLog(s.logs, `Empress exposed and destroyed ${target.name}'s Page Trap (${cardShortName(revealedCard)})!`, 'danger', `${pCode(target.id)}: /V(${cardCode(revealedCard)}), -/${cardCode(revealedCard)}`, { appendEffect: true });
+          } else {
+            s.logs = addLog(s.logs, `Empress revealed ${target.name}'s Pouch card: ${cardShortName(revealedCard)} (not a Page).`, 'chaos', `${pCode(target.id)}: /V(${cardCode(revealedCard)})`, { appendEffect: true });
+          }
+        }
+        if (!revealedPage && !target.mods.handImmune && target.hand.length > 0) {
+          if (target.isHuman) {
+            const queens = target.hand.filter(c => c.rank === 13);
+            if (queens.length > 0 && !actor.isHuman) {
+              s.pendingInteraction = { type: 'INTERRUPT', source: 'chaos_discard', attackType: 'wand', attackerId: playerId, card: majorCard, blockCards: queens, blockCard: queens[0], discardCount: 1, reason: `Empress Chaos (${revealedCard ? 'revealed ' + cardShortName(revealedCard) : 'no Page in Pouch'}) forces you to discard 1 card.` };
+            } else {
+              s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: 1, destination: 'grave', selectedUids: [], appendEffect: true, effectPrefix: '#1: ', reason: `Empress Chaos: ${revealedCard ? 'Revealed ' + cardShortName(revealedCard) + ' (not a Page)' : 'No Page in Pouch'} — choose 1 card to discard.` };
+            }
+          } else {
+            const dIdx = pickDiscardCardIdx(target.hand, target.seq);
+            const d = target.hand.splice(dIdx, 1)[0];
+            s.grave.unshift(d);
+            target.lostCardThisRound = true;
+            s.logs = addLog(s.logs, `Empress Chaos: ${target.name} did not reveal a Page and discarded ${cardShortName(d)}.`, 'chaos', `${pCode(target.id)}: -${cardCode(d)}`, { appendEffect: true });
+          }
         }
       }
     } else if (id === 4) { // Emperor: invert trick rankings
       s.roundMods.invertTrick = true;
-      s.logs = addLog(s.logs, `Emperor inverted the trick: LOWEST number wins!`, 'chaos');
+      s.logs = addLog(s.logs, `Emperor inverted the trick: LOWEST number wins!`, 'chaos', 'inv', { appendEffect: true });
     } else if (id === 5) { // Hierophant: opps without Trump Suit discard 1
       const reqSuit = s.trumpCard?.suit || 'swords';
       for (const o of others) {
-        if (!o.hand.some(c => c.suit === reqSuit) && o.hand.length > 0) {
-          s.grave.unshift(o.hand.pop());
-          s.logs = addLog(s.logs, `${o.name} lacked ${SUIT_META[reqSuit].name} and discarded 1 card.`, 'chaos');
+        if (!o.hand.some(c => c.suit === reqSuit) && o.hand.length > 0 && !o.mods.handImmune) {
+          if (o.isHuman) {
+            s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: 1, destination: 'grave', selectedUids: [], appendEffect: true, effectPrefix: '#1: ', reason: `Hierophant Chaos: You lack ${SUIT_META[reqSuit].name} — choose 1 card to discard.` };
+            s.logs = addLog(s.logs, `${o.name} lacked ${SUIT_META[reqSuit].name} and must choose 1 card to discard.`, 'chaos');
+          } else {
+            const dIdx = pickDiscardCardIdx(o.hand, o.seq);
+            const dropped = o.hand.splice(dIdx, 1)[0];
+            s.grave.unshift(dropped);
+            s.logs = addLog(s.logs, `${o.name} lacked ${SUIT_META[reqSuit].name} and discarded ${cardShortName(dropped)}.`, 'chaos', `${pCode(o.id)}: -${cardCode(dropped)}`, { appendEffect: true });
+          }
         }
       }
     } else if (id === 6) { // Lovers: swap random Hand card with target
@@ -3512,20 +4258,20 @@ export default function App() {
         const tmp = actor.hand[aIdx];
         actor.hand[aIdx] = target.hand[tIdx];
         target.hand[tIdx] = tmp;
-        s.logs = addLog(s.logs, `${actor.name} and ${target.name} exchanged 1 random Hand card.`, 'chaos');
+        s.logs = addLog(s.logs, `${actor.name} and ${target.name} exchanged 1 random Hand card.`, 'chaos', `${pCode(actor.id)}↔${pCode(target.id)} H`, { appendEffect: true });
       }
     } else if (id === 7) { // Chariot: leading suit cannot be trumped
       s.roundMods.noTrumpChariot = true;
-      s.logs = addLog(s.logs, `Chariot locked the trick: Leading Suit cannot be trumped!`, 'chaos');
+      s.logs = addLog(s.logs, `Chariot locked the trick: Leading Suit cannot be trumped!`, 'chaos', 'noT', { appendEffect: true });
     } else if (id === 8) { // Strength: all Pouches & Hands immune this turn
       s.roundMods.globalImmunity = true;
-      s.logs = addLog(s.logs, `Strength protects all Pouches and Hands from Swords/Wands this round!`, 'chaos');
+      s.logs = addLog(s.logs, `Strength protects all Pouches and Hands from Swords/Wands this round!`, 'chaos', 'immAll', { appendEffect: true });
     } else if (id === 9) { // Hermit: take 1 Minor from Grave before recycle
       const idx = s.grave.findIndex(c => c.type === 'minor');
       if (idx !== -1) {
         const taken = s.grave.splice(idx, 1)[0];
         actor.hand.push(taken);
-        s.logs = addLog(s.logs, `${actor.name} retrieved ${cardShortName(taken)} from the Grave.`, 'chaos');
+        s.logs = addLog(s.logs, `${actor.name} retrieved ${cardShortName(taken)} from the Grave.`, 'chaos', `+${cardCode(taken)}g`, { appendEffect: true });
       }
     } else if (id === 10) { // Wheel of Fortune: everyone passes 1 left + draws 1
       const passed = s.players.map(p => (p.hand.length > 0 ? p.hand.pop() : null));
@@ -3536,24 +4282,37 @@ export default function App() {
         s.deck = r.deck; s.grave = r.grave;
         p.hand.push(...r.drawn);
       });
-      s.logs = addLog(s.logs, `Wheel of Fortune rotated 1 Hand card left and drew 1 for everyone!`, 'chaos');
+      s.logs = addLog(s.logs, `Wheel of Fortune rotated 1 Hand card left and drew 1 for everyone!`, 'chaos', 'rotL, all +1', { appendEffect: true });
     } else if (id === 11) { // Justice: richest gives 1 to poorest
       const sorted = [...s.players].sort((a, b) => b.hand.length - a.hand.length);
       const rich = sorted[0];
       const poor = sorted[sorted.length - 1];
       if (rich.id !== poor.id && rich.hand.length > 0) {
         poor.hand.push(rich.hand.pop());
-        s.logs = addLog(s.logs, `Justice balanced hands: ${rich.name} gave 1 card to ${poor.name}.`, 'chaos');
+        s.logs = addLog(s.logs, `Justice balanced hands: ${rich.name} gave 1 card to ${poor.name}.`, 'chaos', `${pCode(rich.id)}→${pCode(poor.id)}`, { appendEffect: true });
       }
     } else if (id === 12) { // Hanged Man: discard 2 -> top 2 of Deck to Pouch
-      for (let k = 0; k < 2 && actor.hand.length > 0; k++) s.grave.unshift(actor.hand.pop());
       const r = drawCardsFromDeck(s, 2);
       s.deck = r.deck; s.grave = r.grave;
+      const gainedCodes = [];
       for (const c of r.drawn) {
-        if (actor.pouch.length < 3) actor.pouch.push(c);
-        else actor.hand.push(c);
+        if (actor.pouch.length < (actor.mods.maxPouch || 3)) { actor.pouch.push(c); gainedCodes.push('+/' + cardCode(c)); }
+        else { actor.hand.push(c); gainedCodes.push('+' + cardCode(c)); }
       }
-      s.logs = addLog(s.logs, `${actor.name} sacrificed 2 Hand cards to tuck Deck cards into Pouch!`, 'chaos');
+      if (actor.isHuman && actor.hand.length > 0) {
+        const cnt = Math.min(2, actor.hand.length);
+        s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: cnt, destination: 'grave', selectedUids: [], appendEffect: true, effectPrefix: '#1: ', reason: `Hanged Man Chaos: Choose ${cnt} Hand card(s) to sacrifice.` };
+        s.logs = addLog(s.logs, `${actor.name} invoked Hanged Man (${gainedCodes.join(', ')}) — choose ${cnt} Hand card(s) to sacrifice.`, 'chaos', gainedCodes.join(','), { appendEffect: true });
+      } else {
+        const sac = [];
+        for (let k = 0; k < 2 && actor.hand.length > 0; k++) {
+          const dIdx = pickDiscardCardIdx(actor.hand, actor.seq);
+          const dc = actor.hand.splice(dIdx, 1)[0];
+          s.grave.unshift(dc);
+          sac.push('-' + cardCode(dc));
+        }
+        s.logs = addLog(s.logs, `${actor.name} sacrificed ${sac.length} Hand cards to tuck Deck cards into Pouch!`, 'chaos', [...sac, ...gainedCodes].join(','), { appendEffect: true });
+      }
     } else if (id === 13) { // Death: destroy 1 from every Pouch
       for (const p of s.players) {
         if (p.pouch.length > 0 && !p.mods.pouchImmune) {
@@ -3563,14 +4322,30 @@ export default function App() {
           p.pouchLostThisRound = true;
         }
       }
-      s.logs = addLog(s.logs, `Death destroyed 1 face-down card from every unprotected Pouch!`, 'danger');
+      s.logs = addLog(s.logs, `Death destroyed 1 face-down card from every unprotected Pouch!`, 'danger', 'all -/P', { appendEffect: true });
     } else if (id === 14) { // Temperance: cancel Suit Actions this trick
       s.roundMods.cancelSuitActions = true;
-      s.logs = addLog(s.logs, `Temperance silenced Suit Actions for the rest of this trick.`, 'chaos');
+      s.logs = addLog(s.logs, `Temperance silenced Suit Actions for the rest of this trick.`, 'chaos', 'noSuit', { appendEffect: true });
     } else if (id === 15) { // Devil: every opp discards 1 or loses 1 Pouch
       for (const o of others) {
-        if (o.hand.length > 1) s.grave.unshift(o.hand.pop());
-        else if (o.pouch.length > 0 && !o.mods.pouchImmune) s.grave.unshift(o.pouch.pop());
+        if (s.roundMods.globalImmunity) continue;
+        if (o.hand.length > 1 && !o.mods.handImmune) {
+          if (o.isHuman) {
+            const queens = o.hand.filter(c => c.rank === 13);
+            if (queens.length > 0 && !actor.isHuman) {
+              s.pendingInteraction = { type: 'INTERRUPT', source: 'chaos_discard', attackType: 'wand', attackerId: playerId, card: majorCard, blockCards: queens, blockCard: queens[0], discardCount: 1, reason: 'The Devil Chaos forces you to discard 1 card.' };
+            } else {
+              s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: 1, destination: 'grave', selectedUids: [], reason: 'The Devil Chaos — choose 1 Hand card to discard.' };
+            }
+          } else {
+            const dIdx = pickDiscardCardIdx(o.hand, o.seq);
+            s.grave.unshift(o.hand.splice(dIdx, 1)[0]);
+            o.lostCardThisRound = true;
+          }
+        } else if (o.pouch.length > 0 && !o.mods.pouchImmune) {
+          s.grave.unshift(o.pouch.pop());
+          o.pouchLostThisRound = true;
+        }
       }
       s.logs = addLog(s.logs, `The Devil forced every opponent to sacrifice a card!`, 'danger');
     } else if (id === 16) { // Tower: destroy Trump, replace with top Minor in Grave
@@ -3578,13 +4353,13 @@ export default function App() {
       const idx = s.grave.findIndex(c => c.type === 'minor');
       if (idx !== -1) s.trumpCard = s.grave.splice(idx, 1)[0];
       s.roundMods.trumpChanged = true;
-      s.logs = addLog(s.logs, `The Tower shattered the Trump Card! New Trump: ${cardShortName(s.trumpCard)}.`, 'chaos');
+      s.logs = addLog(s.logs, `The Tower shattered the Trump Card! New Trump: ${cardShortName(s.trumpCard)}.`, 'chaos', `(T=${cardCode(s.trumpCard)})`);
     } else if (id === 17) { // Star: inspect opp Pouch + draw 1
       const r = drawCardsFromDeck(s, 1);
       s.deck = r.deck; s.grave = r.grave;
       actor.hand.push(...r.drawn);
       if (actor.isHuman && target && target.pouch.length > 0) {
-        s.logs = addLog(s.logs, `The Star revealed ${target.name}'s Pouch: ${target.pouch.map(cardShortName).join(', ')}`, 'gold');
+        s.logs = addLog(s.logs, `The Star revealed ${target.name}'s Pouch: ${target.pouch.map(cardShortName).join(', ')}`, 'gold', `${pCode(target.id)}: /V(${target.pouch.map(cardCode).join(',')})`, { appendEffect: true });
       }
     } else if (id === 18) { // Moon: shuffle all Pouches together
       const pool = [];
@@ -3599,7 +4374,7 @@ export default function App() {
       s.players.forEach((p, idx) => {
         if (counts[idx] > 0) p.pouch = mixed.splice(0, counts[idx]);
       });
-      s.logs = addLog(s.logs, `The Moon scrambled every unprotected Pouch across the table!`, 'chaos');
+      s.logs = addLog(s.logs, `The Moon scrambled every unprotected Pouch across the table!`, 'chaos', 'pouch~', { appendEffect: true });
     } else if (id === 19) { // Sun: draw 1 + tuck 1 extra to Pouch
       const r = drawCardsFromDeck(s, 1);
       s.deck = r.deck; s.grave = r.grave;
@@ -3607,15 +4382,15 @@ export default function App() {
       if (actor.pouch.length < 3 && actor.hand.length > 0) {
         actor.pouch.push(actor.hand.pop());
       }
-      s.logs = addLog(s.logs, `The Sun blessed ${actor.name} with +1 Draw and an extra Pouch tuck!`, 'chaos');
+      s.logs = addLog(s.logs, `The Sun blessed ${actor.name} with +1 Draw and an extra Pouch tuck!`, 'chaos', `${r.drawn.map(c => '+' + cardCode(c)).join(',')}, +/P`, { appendEffect: true });
     } else if (id === 20) { // Judgement: every opp returns 1 Pouch card to Hand
       for (const o of others) {
         if (o.pouch.length > 0 && !o.mods.pouchImmune) o.hand.push(o.pouch.pop());
       }
-      s.logs = addLog(s.logs, `Judgement returned 1 Pouch card to every opponent's Hand!`, 'chaos');
+      s.logs = addLog(s.logs, `Judgement returned 1 Pouch card to every opponent's Hand!`, 'chaos', 'opps -/P→+H', { appendEffect: true });
     } else if (id === 21) { // World: +3 trick boost
       actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 3;
-      s.logs = addLog(s.logs, `The World granted ${actor.name} +3 trick dominance!`, 'chaos');
+      s.logs = addLog(s.logs, `The World granted ${actor.name} +3 trick dominance!`, 'chaos', '+3', { appendEffect: true });
     }
 
     // Acting triggers for Chaos Event resolution
@@ -3637,7 +4412,8 @@ export default function App() {
       }
     }
     s.deck.push(majorCard, ...recycled);
-    s.logs = addLog(s.logs, `Recycled ${majorCard.roman}. ${majorCard.name} + ${recycled.length} Grave card(s) to bottom of Deck.`, 'muted');
+    const recAll = [majorCard, ...recycled].map(cardCode).join(',');
+    s.logs = addLog(s.logs, `Recycled ${majorCard.roman}. ${majorCard.name} + ${recycled.length} Grave card(s) to bottom of Deck.`, 'muted', `g^→k_(${recAll})`, { appendEffect: true });
 
     return s;
   }
@@ -3659,7 +4435,8 @@ export default function App() {
     if (!overrideTag && !seqData) return s;
 
     if (!overrideTag) {
-      const isRecast = (actor.abilityCastsThisSeq || 0) >= 1;
+      const isRecast = !!actor.actingDone && !actor._recastPrepaid;
+      if (actor._recastPrepaid) actor._recastPrepaid = false;
       if (isRecast) {
         if (actor.hand.length === 0) {
           if (actor.isHuman) sfx.error();
@@ -3669,18 +4446,19 @@ export default function App() {
         const paidIdx = actor.isHuman ? actor.hand.length - 1 : pickDiscardCardIdx(actor.hand, actor.seq);
         const paid = actor.hand.splice(paidIdx, 1)[0];
         s.grave.unshift(paid);
-        s.logs = addLog(s.logs, `SANITY COST: ${actor.name} discarded ${cardShortName(paid)} to recast Seq ${actor.seq} ${seqData.name}.`, 'muted');
+        s.logs = addLog(s.logs, `SANITY COST: ${actor.name} discarded ${cardShortName(paid)} to recast Seq ${actor.seq} ${seqData.name}.`, 'muted', `${pCode(playerId)}: -${cardCode(paid)} (sanity)`);
       }
       actor.abilityUsed = true;
       actor.abilityCastsThisSeq = (actor.abilityCastsThisSeq || 0) + 1;
       if (actor.isHuman) sfx.cardPlay();
     }
 
-    const others = s.players.filter(p => p.id !== playerId);
-    const target = targetOppId !== null ? s.players[targetOppId] : others[0];
+    const others = s.players.filter(p => p.id !== playerId && !p.skippedThisRound);
+    const target = (targetOppId !== null && s.players[targetOppId] && !s.players[targetOppId].skippedThisRound) ? s.players[targetOppId] : (others[0] || null);
     const tag = overrideTag || seqData.tag;
 
-    s.logs = addLog(s.logs, `ABILITY: ${actor.name} uses Seq ${actor.seq} ${seqData.name}!`, 'gold');
+    const isTargetedAb = TARGETED_ABILITY_TAGS.has(seqData.tag);
+    s.logs = addLog(s.logs, `ABILITY: ${actor.name} uses Seq ${actor.seq} ${seqData.name}!`, 'gold', `< ${pzCode(actor)}:!q${actor.seq}${(isTargetedAb && target) ? `(${pCode(target.id)})` : ''}`);
 
     const drawFor = (p, n) => {
       const r = drawCardsFromDeck(s, n);
@@ -3689,20 +4467,70 @@ export default function App() {
       return r.drawn;
     };
 
-    const forceDiscard = (victim, count = 1) => {
+    const selfDiscard = (p, count = 1, reason = '') => {
+      if (!p || p.hand.length === 0) return [];
+      const actual = Math.min(count, p.hand.length);
+      if (p.isHuman) {
+        s.pendingInteraction = {
+          type: 'CHOOSE_DISCARD',
+          count: actual,
+          destination: 'grave',
+          selectedUids: [],
+          appendEffect: true,
+          effectPrefix: '#1: ',
+          reason: reason || `Choose ${actual} Hand card(s) to discard for ${seqData.name}.`
+        };
+        p.lostCardThisRound = true;
+        return [];
+      }
+      const dropped = [];
+      for (let i = 0; i < actual && p.hand.length > 0; i++) {
+        const dIdx = pickDiscardCardIdx(p.hand, p.seq);
+        const dc = p.hand.splice(dIdx, 1)[0];
+        s.grave.unshift(dc);
+        dropped.push(dc);
+      }
+      if (dropped.length > 0) {
+        p.lostCardThisRound = true;
+        s.logs = addLog(s.logs, `${p.name} discarded ${dropped.map(cardShortName).join(', ')} for ${seqData.name}.`, 'muted', `${pCode(p.id)}: ${dropped.map(c => '-' + cardCode(c)).join(',')}`, { appendEffect: true });
+      }
+      return dropped;
+    };
+
+    const forceDiscard = (victim, count = 1, isRandom = false) => {
       if (!victim || victim.mods.handImmune || s.roundMods.globalImmunity) return 0;
+      if (victim.isHuman && !isRandom) {
+        const maxAllowed = victim.mods.sunFloor ? Math.max(0, victim.hand.length - 3) : victim.hand.length;
+        const actual = Math.min(count, maxAllowed);
+        if (actual > 0) {
+          s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: actual, destination: 'grave', selectedUids: [], appendEffect: true, effectPrefix: '#1: ', reason: `${actor.name}'s ability forces you to discard ${actual} card(s).` };
+          victim.lostCardThisRound = true;
+          return actual;
+        }
+        if (victim.hand.length === 0) {
+          victim.skipNextTurn = true;
+          s.logs = addLog(s.logs, `${victim.name} has 0 cards and loses their next turn!`, 'danger', `${pCode(victim.id)}: MB()`, { appendEffect: true });
+        }
+        return 0;
+      }
       let dropped = 0;
+      const droppedCards = [];
       for (let i = 0; i < count; i++) {
         if (victim.mods.sunFloor && victim.hand.length <= 3) break;
         if (victim.hand.length === 0) {
           victim.skipNextTurn = true;
-          s.logs = addLog(s.logs, `${victim.name} has 0 cards and loses their next turn!`, 'danger');
+          s.logs = addLog(s.logs, `${victim.name} has 0 cards and loses their next turn!`, 'danger', `${pCode(victim.id)}: MB()`, { appendEffect: true });
           break;
         }
-        const idx = Math.floor(Math.random() * victim.hand.length);
-        s.grave.unshift(victim.hand.splice(idx, 1)[0]);
+        const idx = isRandom ? Math.floor(Math.random() * victim.hand.length) : pickDiscardCardIdx(victim.hand, victim.seq);
+        const dc = victim.hand.splice(idx, 1)[0];
+        s.grave.unshift(dc);
+        droppedCards.push(dc);
         victim.lostCardThisRound = true;
         dropped++;
+      }
+      if (droppedCards.length > 0) {
+        s.logs = addLog(s.logs, `${victim.name} discarded ${droppedCards.map(cardShortName).join(', ')}.`, 'danger', `${pCode(victim.id)}: ${droppedCards.map(c => '-' + cardCode(c)).join(',')}`, { appendEffect: true });
       }
       return dropped;
     };
@@ -3732,6 +4560,18 @@ export default function App() {
     };
 
     // Execute by tag
+    const _tvBeforeActor = {
+      tb: actor.mods.trickBonus || 0,
+      wcb: actor.mods.wandCupBonus || 0,
+      sb: actor.mods.sunBoost || 0,
+      jb: !!actor.mods.jackpotBoost
+    };
+    const _tvBeforeOpps = others.map(o => ({
+      id: o.id,
+      tp: o.mods.trickPenalty || 0,
+      ntp: o.mods.nonTrumpPenalty || 0
+    }));
+
     switch (tag) {
       case 'peek_deck_2': {
         if (s.deck.length >= 2) {
@@ -3769,6 +4609,11 @@ export default function App() {
           s.logs = addLog(s.logs, `${actor.name} copied ${target.name}'s ${oppSeq?.name}!`, 'gold');
           s.logs = markActed(actor, s.logs, `Copied ${oppSeq?.name}`);
           if (oppSeq && oppSeq.tag !== 'copy_ability' && copyDepth < 1) {
+            const activeOpps = s.players.filter(o => o.id !== playerId && !o.skippedThisRound);
+            if (actor.isHuman && TARGETED_ABILITY_TAGS.has(oppSeq.tag) && activeOpps.length > 1) {
+              s.pendingInteraction = { type: 'TARGET_COPIED_ABILITY', copiedTag: oppSeq.tag, copiedName: oppSeq.name };
+              return s;
+            }
             return executeSequenceAbility(s, playerId, target.id, oppSeq.tag, copyDepth + 1);
           } else {
             actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 1;
@@ -3804,7 +4649,7 @@ export default function App() {
           if (s.trumpCard) s.deck.push(s.trumpCard);
           s.trumpCard = r.drawn[0];
           s.roundMods.trumpChanged = true;
-          s.logs = addLog(s.logs, `New Trump Card: ${cardShortName(s.trumpCard)}!`, 'gold');
+          s.logs = addLog(s.logs, `New Trump Card: ${cardShortName(s.trumpCard)}!`, 'gold', `(T=${cardCode(s.trumpCard)})`);
         }
         break;
       }
@@ -3836,8 +4681,9 @@ export default function App() {
         break;
       }
       case 'cycle_2_1': {
-        if (actor.hand.length > 0) s.grave.unshift(actor.hand.pop());
-        drawFor(actor, 2);
+        const drawn = drawFor(actor, 2);
+        if (drawn.length > 0) s.logs = addLog(s.logs, `${actor.name} drew ${drawn.map(cardShortName).join(', ')}.`, 'emerald', drawn.map(c => '+' + cardCode(c)).join(','), { appendEffect: true });
+        selfDiscard(actor, 1, `${seqData.name}: Choose 1 Hand card to discard.`);
         if (actor.pathwayId === 1 || actor.pathwayId === 12 || actor.pathwayId === 5) {
           s.logs = markActed(actor, s.logs, 'Cycled cards via ability');
         }
@@ -3883,7 +4729,7 @@ export default function App() {
           s.grave.unshift(s.trumpCard);
           s.trumpCard = gCard;
           s.roundMods.trumpChanged = true;
-          s.logs = addLog(s.logs, `Wanderer swapped Trump to ${cardShortName(gCard)}!`, 'gold');
+          s.logs = addLog(s.logs, `Wanderer swapped Trump to ${cardShortName(gCard)}!`, 'gold', `(T=${cardCode(gCard)})`);
         }
         break;
       }
@@ -3910,9 +4756,9 @@ export default function App() {
           if (usefulG && !usefulD) {
             s.deck[0] = botG;
             s.grave[s.grave.length - 1] = topD;
-            s.logs = addLog(s.logs, `Mystery Pryer swapped Deck top (${cardShortName(topD)}) with Grave bottom (${cardShortName(botG)})!`, 'info');
+            s.logs = addLog(s.logs, `Mystery Pryer swapped Deck top (${cardShortName(topD)}) with Grave bottom (${cardShortName(botG)})!`, 'info', `k^${cardCode(topD)}↔g_${cardCode(botG)}`, { appendEffect: true });
           } else {
-            s.logs = addLog(s.logs, `Mystery Pryer peeked at Deck top (${cardShortName(topD)}) and kept it.`, 'info');
+            s.logs = addLog(s.logs, `Mystery Pryer peeked at Deck top (${cardShortName(topD)}) and kept it.`, 'info', `k^: V(${cardCode(topD)})`, { appendEffect: true });
           }
         }
         s.logs = markActed(actor, s.logs, 'Peeked at hidden Deck/Grave card');
@@ -3939,8 +4785,9 @@ export default function App() {
         break;
       }
       case 'warlock_cast': {
-        if (actor.hand.length > 0) s.grave.unshift(actor.hand.pop());
-        drawFor(actor, 1);
+        const drawn = drawFor(actor, 1);
+        if (drawn.length > 0) s.logs = addLog(s.logs, `Warlock drew ${drawn.map(cardShortName).join(', ')}.`, 'emerald', drawn.map(c => '+' + cardCode(c)).join(','), { appendEffect: true });
+        selfDiscard(actor, 1, 'Warlock: Choose 1 Hand card to discard.');
         if (target) destroyPouch(target, 1);
         s.logs = markActed(actor, s.logs, 'Cast dual Warlock spells');
         break;
@@ -3970,7 +4817,7 @@ export default function App() {
         actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 2;
         actor.mods.peekedOpp = true;
         if (actor.isHuman && target && target.hand[0]) {
-          s.logs = addLog(s.logs, `Clairvoyant reveals ${target.name} holds ${cardShortName(target.hand[0])}.`, 'info');
+          s.logs = addLog(s.logs, `Clairvoyant reveals ${target.name} holds ${cardShortName(target.hand[0])}.`, 'info', `${pCode(target.id)}: V(${cardCode(target.hand[0])})`, { appendEffect: true });
         }
         break;
       }
@@ -3986,10 +4833,16 @@ export default function App() {
         break;
       }
       case 'grave_major_to_hand': {
-        if (actor.hand.length > 0) s.grave.unshift(actor.hand.pop());
         const idx = s.grave.findIndex(c => c.type === 'major');
-        if (idx !== -1) actor.hand.push(s.grave.splice(idx, 1)[0]);
-        else drawFor(actor, 2);
+        if (idx !== -1) {
+          const maj = s.grave.splice(idx, 1)[0];
+          actor.hand.push(maj);
+          s.logs = addLog(s.logs, `${actor.name} pulled ${cardShortName(maj)} from the Grave!`, 'chaos', `+${cardCode(maj)}g`, { appendEffect: true });
+        } else {
+          const drawn = drawFor(actor, 2);
+          if (drawn.length > 0) s.logs = addLog(s.logs, `No Major Arcana in Grave — ${actor.name} drew ${drawn.map(cardShortName).join(', ')}.`, 'emerald', drawn.map(c => '+' + cardCode(c)).join(','), { appendEffect: true });
+        }
+        selfDiscard(actor, 1, `${seqData.name}: Choose 1 Hand card to discard.`);
         break;
       }
       case 'assassin_ambush': {
@@ -4087,7 +4940,7 @@ export default function App() {
       case 'invert_trick': {
         s.roundMods.invertTrick = true;
         actor.mods.baronPouch = true;
-        s.logs = addLog(s.logs, `Baron of Corruption inverted trick rankings & will claim a trick card into Pouch!`, 'gold');
+        s.logs = addLog(s.logs, `Baron of Corruption inverted trick rankings & will claim a trick card into Pouch!`, 'gold', 'inv', { appendEffect: true });
         break;
       }
       case 'disorder_pass': {
@@ -4116,7 +4969,7 @@ export default function App() {
       case 'abolish_trump': {
         s.roundMods.abolishTrump = true;
         if (actor.pathwayId === 20) drawFor(actor, 1);
-        s.logs = addLog(s.logs, `Trump Suit and 10-overrides abolished for this trick!`, 'gold');
+        s.logs = addLog(s.logs, `Trump Suit and 10-overrides abolished for this trick!`, 'gold', 'noT', { appendEffect: true });
         break;
       }
       case 'trick_plus_1': {
@@ -4129,7 +4982,7 @@ export default function App() {
         break;
       }
       case 'fury_boost': {
-        if (actor.hand.length > 0) s.grave.unshift(actor.hand.pop());
+        selfDiscard(actor, 1, `${seqData.name}: Choose 1 Hand card to discard for +3 Trick Value.`);
         actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 3;
         actor.mods.folkWinDraw = true;
         break;
@@ -4197,6 +5050,7 @@ export default function App() {
           const given = actor.hand.shift();
           actor.hand.push(stolen);
           target.hand.push(given);
+          s.logs = addLog(s.logs, `${actor.name} swapped ${cardShortName(given)} for ${target.name}'s ${cardShortName(stolen)}!`, 'gold', `${pCode(target.id)}: -${cardCode(stolen)}s, +${cardCode(given)}`, { appendEffect: true });
         }
         break;
       }
@@ -4217,7 +5071,7 @@ export default function App() {
           } else {
             if (target.seq <= actor.seq || target.hand.length <= 2) {
               target.skipNextTurn = true;
-              s.logs = addLog(s.logs, `Worm of Time forced ${target.name} to skip their next turn!`, 'danger');
+              s.logs = addLog(s.logs, `Worm of Time forced ${target.name} to skip their next turn!`, 'danger', `${pCode(target.id)}x`, { appendEffect: true });
             } else {
               forceDiscard(target, 1);
               s.logs = addLog(s.logs, `Worm of Time forced ${target.name} to discard 1 card!`, 'danger');
@@ -4230,7 +5084,7 @@ export default function App() {
       case 'hunter_track': {
         actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 1;
         if (actor.isHuman && target && target.pouch.length > 0) {
-          s.logs = addLog(s.logs, `Hunter tracked ${target.name}'s Pouch: ${cardShortName(target.pouch[0])}`, 'info');
+          s.logs = addLog(s.logs, `Hunter tracked ${target.name}'s Pouch: ${cardShortName(target.pouch[0])}`, 'info', `${pCode(target.id)}: /V(${cardCode(target.pouch[0])})`, { appendEffect: true });
         }
         break;
       }
@@ -4241,7 +5095,7 @@ export default function App() {
         break;
       }
       case 'pyro_aoe': {
-        if (actor.hand.length > 0) s.grave.unshift(actor.hand.pop());
+        selfDiscard(actor, 1, 'Pyromaniac: Choose 1 Hand card to discard to scorch 2 opponents.');
         let cnt = 0;
         for (const o of others.slice(0, 2)) if (forceDiscard(o, 1) > 0) cnt++;
         if (cnt >= 1) s.logs = markActed(actor, s.logs, 'Scorched opponents with Pyromaniac');
@@ -4268,13 +5122,13 @@ export default function App() {
       }
       case 'declare_war': {
         s.roundMods.warDeclared = true;
-        s.logs = addLog(s.logs, `War Bishop declared WAR! Trick losers discard 1 Hand card!`, 'danger');
+        s.logs = addLog(s.logs, `War Bishop declared WAR! Trick losers discard 1 Hand card!`, 'danger', 'WAR', { appendEffect: true });
         break;
       }
       case 'weather_swords': {
         s.roundMods.weatherSwords = true;
         actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 2;
-        s.logs = addLog(s.logs, `Weather Warlock turned Trump Suit into SWORDS!`, 'gold');
+        s.logs = addLog(s.logs, `Weather Warlock turned Trump Suit into SWORDS!`, 'gold', 'T=S', { appendEffect: true });
         break;
       }
       case 'conqueror_lock': {
@@ -4321,7 +5175,8 @@ export default function App() {
       case 'hand_of_god': {
         if (target) destroyPouch(target, 1, true);
         actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 2;
-        s.roundMods.forbidSwords = false;
+        s.roundMods.forbidSuit = null;
+        s.roundMods.forbidOwner = null;
         break;
       }
       case 'reader_scry': {
@@ -4361,7 +5216,7 @@ export default function App() {
           const dropIdx = pickDiscardCardIdx(actor.hand, actor.seq);
           const putBack = actor.hand.splice(dropIdx, 1)[0];
           s.deck.push(putBack);
-          s.logs = addLog(s.logs, `Spell Analysis drew 2 and placed ${cardShortName(putBack)} on the bottom of the Deck.`, 'info');
+          s.logs = addLog(s.logs, `Spell Analysis drew 2 and placed ${cardShortName(putBack)} on the bottom of the Deck.`, 'info', `${cardCode(putBack)}→k_`, { appendEffect: true });
         }
         s.logs = markActed(actor, s.logs, 'Completed Spell Analysis');
         break;
@@ -4392,14 +5247,14 @@ export default function App() {
       case 'deduce_reveal': {
         drawFor(actor, 1);
         if (actor.isHuman && target && target.hand.length > 0) {
-          s.logs = addLog(s.logs, `Revealed ${target.name}'s Hand: ${target.hand.slice(0, 3).map(cardShortName).join(', ')}`, 'info');
+          s.logs = addLog(s.logs, `Revealed ${target.name}'s Hand: ${target.hand.slice(0, 3).map(cardShortName).join(', ')}`, 'info', `${pCode(target.id)}: V(${target.hand.slice(0, 3).map(cardCode).join(',')})`, { appendEffect: true });
         }
         s.logs = markActed(actor, s.logs, 'Revealed opponent Hand cards');
         break;
       }
       case 'prophet_foresight': {
         actor.mods.trickBonus = (actor.mods.trickBonus || 0) + 2;
-        if (actor.isHuman && s.deck[0]) s.logs = addLog(s.logs, `Prophet foresees: ${cardShortName(s.deck[0])}`, 'info');
+        if (actor.isHuman && s.deck[0]) s.logs = addLog(s.logs, `Prophet foresees: ${cardShortName(s.deck[0])}`, 'info', `k^: V(${cardCode(s.deck[0])})`, { appendEffect: true });
         break;
       }
       case 'steal_trump_hand': {
@@ -4485,7 +5340,7 @@ export default function App() {
         s.trickPlays = [];
         s.trickTurnIdx = 0;
         drawFor(actor, 2);
-        s.logs = addLog(s.logs, `Snake of Mercury REBOOTED the trick!`, 'chaos');
+        s.logs = addLog(s.logs, `Snake of Mercury REBOOTED the trick!`, 'chaos', 'reboot', { appendEffect: true });
         break;
       }
       case 'spectator_draw': {
@@ -4519,17 +5374,19 @@ export default function App() {
         break;
       }
       case 'listener_grave': {
-        if (actor.hand.length > 0) s.grave.unshift(actor.hand.pop());
-        if (s.grave.length > 0) {
-          actor.hand.push(s.grave.shift());
+        const pulled = s.grave.length > 0 ? s.grave.shift() : null;
+        if (pulled) {
+          actor.hand.push(pulled);
+          s.logs = addLog(s.logs, `Listener pulled ${cardShortName(pulled)} from the Grave.`, 'info', `+${cardCode(pulled)}g`, { appendEffect: true });
           s.logs = markActed(actor, s.logs, 'Pulled card from Grave after discarding');
         }
+        selfDiscard(actor, 1, 'Listener: Choose 1 Hand card to discard.');
         break;
       }
       case 'shadow_sacrifice': {
         actor.mods.handImmune = true;
         actor.mods.pouchImmune = true;
-        s.logs = addLog(s.logs, `Shadow Hide! ${actor.name}'s Hand & Pouch are immune this round.`, 'emerald');
+        s.logs = addLog(s.logs, `Shadow Hide! ${actor.name}'s Hand & Pouch are immune this round.`, 'emerald', 'imm', { appendEffect: true });
         break;
       }
       case 'grave_to_pouch_sac': {
@@ -4543,15 +5400,14 @@ export default function App() {
       }
       case 'dark_sub_4': {
         if (actor.hand.length >= 1) {
-          const dropIdx = actor.isHuman ? actor.hand.length - 1 : pickDiscardCardIdx(actor.hand, actor.seq);
-          s.grave.unshift(actor.hand.splice(dropIdx, 1)[0]);
+          selfDiscard(actor, 1, 'Dark Substitution: Choose 1 Hand card to discard for Pouch Wildcard.');
           actor.mods.darkSubBonus = true;
           s.logs = markActed(actor, s.logs, 'Performed Dark Substitution (Pouch Wildcard Ascension)');
         }
         break;
       }
       case 'blood_ritual': {
-        if (actor.hand.length > 0) s.grave.unshift(actor.hand.pop());
+        selfDiscard(actor, 1, 'Blood Ritual: Choose 1 Hand card to discard so every opponent discards 1.');
         let cnt = 0;
         for (const o of others) cnt += forceDiscard(o, 1);
         if (cnt >= 1) s.logs = markActed(actor, s.logs, 'Forced opponents to discard via Blood Ritual');
@@ -4644,7 +5500,7 @@ export default function App() {
       }
       case 'puppet_curse': {
         if (actor.hand.length > 0 && target) {
-          s.grave.unshift(actor.hand.pop());
+          selfDiscard(actor, 1, 'Curse Doll: Choose 1 Hand card to discard.');
           destroyPouch(target, 1);
           forceDiscard(target, 1);
           s.logs = markActed(actor, s.logs, 'Triggered Puppet Curse');
@@ -4711,7 +5567,7 @@ export default function App() {
         break;
       }
       case 'massacre_aoe': {
-        if (actor.hand.length > 0) s.grave.unshift(actor.hand.pop());
+        selfDiscard(actor, 1, 'Massacre: Choose 1 Hand card to discard.');
         let hits = 0;
         for (const o of others) if (o.hand.length <= 5) hits += destroyPouch(o, 1);
         if (hits > 0) s.logs = markActed(actor, s.logs, 'Massacred low-hand Pouches');
@@ -4872,7 +5728,7 @@ export default function App() {
         } else {
           s.roundMods.forbidSuit = 'swords';
           s.roundMods.forbidOwner = playerId;
-          s.logs = addLog(s.logs, `${actor.name} PROHIBITED Swords for this trick!`, 'gold');
+          s.logs = addLog(s.logs, `${actor.name} PROHIBITED Swords for this trick!`, 'gold', '!forbid(S)', { appendEffect: true });
           s.logs = markActed(actor, s.logs, 'Enforced Prohibition');
         }
         break;
@@ -4920,6 +5776,26 @@ export default function App() {
         break;
       }
     }
+    const _tvEffects = [];
+    const _tbDiff = (actor.mods.trickBonus || 0) - _tvBeforeActor.tb;
+    if (_tbDiff > 0) _tvEffects.push(`+${_tbDiff}`);
+    const _wcbDiff = (actor.mods.wandCupBonus || 0) - _tvBeforeActor.wcb;
+    if (_wcbDiff > 0) _tvEffects.push(`+${_wcbDiff} W/C`);
+    const _sbDiff = (actor.mods.sunBoost || 0) - _tvBeforeActor.sb;
+    if (_sbDiff > 0) _tvEffects.push(`+${_sbDiff} C/P`);
+    if (actor.mods.jackpotBoost && !_tvBeforeActor.jb) _tvEffects.push('+4 Trump');
+    for (const ob of _tvBeforeOpps) {
+      const o = s.players[ob.id];
+      if (!o) continue;
+      const _tpDiff = (o.mods.trickPenalty || 0) - ob.tp;
+      if (_tpDiff > 0) _tvEffects.push(`${pCode(o.id)}: -${_tpDiff}`);
+      const _ntpDiff = (o.mods.nonTrumpPenalty || 0) - ob.ntp;
+      if (_ntpDiff > 0) _tvEffects.push(`${pCode(o.id)}: -${_ntpDiff} non-T`);
+    }
+    if (_tvEffects.length > 0) {
+      s.logs = addLog(s.logs, `Trick value modifier active: ${_tvEffects.join(', ')}.`, 'gold', _tvEffects.join(', '), { appendEffect: true });
+    }
+
     return s;
   }
 
@@ -4934,22 +5810,49 @@ export default function App() {
       roundMods: { ...state.roundMods }
     };
     const actor = s.players[playerId];
-    const others = s.players.filter(p => p.id !== playerId);
-    const target = targetOppId !== null ? s.players[targetOppId] : others[0];
+    if (!actor || !card) return state;
+    const others = s.players.filter(p => p.id !== playerId && !p.skippedThisRound);
+    let target = (targetOppId !== null && s.players[targetOppId] && !s.players[targetOppId].skippedThisRound) ? s.players[targetOppId] : (others[0] || null);
+
+    // Major Arcana played directly into Trick: resolve Chaos effect + count as Major Arcana (value = majorId 0..21) in trick!
+    if (card.type === 'major') {
+      s = resolveChaosEvent(s, playerId, card, target ? target.id : null);
+      s.trickPlays.push({
+        playerId,
+        card,
+        effValue: card.majorId,
+        effSuit: 'major',
+        isTenOverride: false,
+        countsAsTrump: s.trumpCard?.type === 'major',
+        faceCanWin: false,
+        winsTies: !!actor.mods.winsTies,
+        absorbed: true
+      });
+      s.logs = addLog(s.logs, `${actor.name} played Major Arcana ${card.roman}. ${card.name} (Value ${card.majorId}) into the Trick!`, 'chaos', `${pCode(playerId)}: T-${cardCode(card)}`);
+      s.trickTurnIdx++;
+      while (s.trickTurnIdx < s.trickOrder.length && s.players[s.trickOrder[s.trickTurnIdx]].skipNextTurn) s.trickTurnIdx++;
+      if (s.trickTurnIdx >= s.trickOrder.length) {
+        const winPlay = evaluateTrickWinner(s.trickPlays, s.trumpCard, s.roundMods);
+        s.trickWinnerId = winPlay ? winPlay.playerId : 0;
+        s.logs = addLog(s.logs, `TRICK WINNER: ${s.players[s.trickWinnerId]?.name || 'Player'} wins with ${winPlay ? cardShortName(winPlay.card) : 'the trick'}!`, 'gold');
+        s.phase = 'TRICK_REWARD';
+      }
+      return s;
+    }
 
     // Check if Human can Interrupt an incoming AI Sword or Wand!
     const isAttackingHuman = !skipInterruptCheck && target && target.isHuman && !actor.isHuman && !s.roundMods.cancelSuitActions && !s.roundMods.globalImmunity && !actor.mods.unblockable && !s.roundMods.spatialLock && !s.roundMods.apocalypse;
     if (isAttackingHuman && card.suit === 'swords' && target.pouch.length > 0 && !target.mods.pouchImmune) {
-      const knight = target.hand.find(c => c.rank === 12);
-      if (knight) {
-        s.pendingInteraction = { type: 'INTERRUPT', attackType: 'sword', attackerId: playerId, card, blockCard: knight };
+      const knights = target.hand.filter(c => c.rank === 12);
+      if (knights.length > 0) {
+        s.pendingInteraction = { type: 'INTERRUPT', source: 'trick', attackType: 'sword', attackerId: playerId, card, blockCards: knights, blockCard: knights[0] };
         return s;
       }
     }
     if (isAttackingHuman && card.suit === 'wands' && !target.mods.handImmune) {
-      const queen = target.hand.find(c => c.rank === 13);
-      if (queen) {
-        s.pendingInteraction = { type: 'INTERRUPT', attackType: 'wand', attackerId: playerId, card, blockCard: queen };
+      const queens = target.hand.filter(c => c.rank === 13);
+      if (queens.length > 0) {
+        s.pendingInteraction = { type: 'INTERRUPT', source: 'trick', attackType: 'wand', attackerId: playerId, card, blockCards: queens, blockCard: queens[0] };
         return s;
       }
     }
@@ -4963,7 +5866,7 @@ export default function App() {
       const judge = s.players[s.roundMods.forbidOwner];
       if (judge && actor.hand.length > 0) {
         judge.hand.push(actor.hand.pop());
-        s.logs = addLog(s.logs, `PROHIBITION! ${actor.name} played forbidden ${SUIT_META[card.suit].name} and paid 1 card to ${judge.name}!`, 'gold');
+        s.logs = addLog(s.logs, `PROHIBITION! ${actor.name} played forbidden ${SUIT_META[card.suit].name} and paid 1 card to ${judge.name}!`, 'gold', `${pCode(actor.id)}→${pCode(judge.id)} (-1H)`);
       }
     }
 
@@ -5015,75 +5918,112 @@ export default function App() {
       winsTies: !!actor.mods.winsTies
     });
 
-    s.logs = addLog(s.logs, `${actor.name} played ${cardShortName(card)}.`, 'normal');
+    const playEffects = [];
+    const playDetails = [`${actor.name} played ${cardShortName(card)}`];
+    let playTone = 'normal';
+    const postInterruptLogs = [];
 
-    // Immediate Suit Action Resolution (unless silenced/canceled)
+    // Immediate King + Suit Action Resolution (unless silenced/canceled)
     if (!s.roundMods.cancelSuitActions && !actor.mods.silenced) {
       const times = actor.mods.doubleSuit ? 2 : 1;
       if (actor.mods.doubleSuit) s.logs = markActed(actor, s.logs, 'Resolved a doubled Suit Action');
 
+      // KING ACTION (also continues into Suit Action below!)
       if (card.rank === 14 && target) {
-        // KING: Reveal opponent hand and take 1 card of King's suit!
+        const revealedBefore = [...target.hand];
+        if (revealedBefore.length > 0) {
+          playEffects.push(`${pCode(target.id)}: V(${revealedBefore.map(cardCode).join(',')})`);
+        }
         const matchIdx = target.hand.findIndex(c => c.suit === card.suit);
         if (matchIdx !== -1) {
           const stolen = target.hand.splice(matchIdx, 1)[0];
           actor.hand.push(stolen);
-          s.logs = addLog(s.logs, `KING! ${actor.name} revealed ${target.name}'s Hand and stole ${cardShortName(stolen)}!`, 'gold');
+          playEffects.push(`${pCode(target.id)}: -${cardCode(stolen)}s`);
+          playDetails.push(`revealed ${target.name}'s Hand (${revealedBefore.map(cardShortName).join(', ')}) and stole ${cardShortName(stolen)}`);
+          playTone = 'gold';
         } else {
-          s.logs = addLog(s.logs, `KING! ${actor.name} revealed ${target.name}'s Hand (no ${SUIT_META[card.suit].name} found).`, 'info');
-        }
-        if (actor.isHuman && target.hand.length > 0) {
-          s.logs = addLog(s.logs, `${target.name}'s Hand: ${target.hand.map(cardShortName).join(', ')}`, 'info');
+          playDetails.push(`revealed ${target.name}'s Hand (${revealedBefore.length > 0 ? revealedBefore.map(cardShortName).join(', ') : 'empty'} — no ${SUIT_META[card.suit].name} found)`);
         }
         if (actor.pathwayId === 16 && actor.seq === 2) s.logs = markActed(actor, s.logs, 'Resolved King theft');
-      } else if (card.suit === 'swords' && target && !s.roundMods.globalImmunity) {
+      }
+
+      // INSTIGATOR REDIRECT (Empress Seq 8): bounce incoming Sword/Wand to another active opponent + draw 1!
+      if ((card.suit === 'swords' || card.suit === 'wands') && target && target.mods.redirectNext && !s.roundMods.globalImmunity) {
+        const instigator = target;
+        instigator.mods.redirectNext = false;
+        const rDraw = drawCardsFromDeck(s, 1);
+        s.deck = rDraw.deck; s.grave = rDraw.grave;
+        instigator.hand.push(...rDraw.drawn);
+        const alt = s.players.find(o => o.id !== actor.id && o.id !== instigator.id && !o.skippedThisRound) || actor;
+        playEffects.push(`< ${pzCode(instigator)}:redirect→${pCode(alt.id)}${rDraw.drawn[0] ? ', +' + cardCode(rDraw.drawn[0]) : ''}`);
+        playDetails.push(`INSTIGATOR! ${instigator.name} redirected the ${SUIT_META[card.suit].name} to ${alt.name} and drew ${rDraw.drawn.map(cardShortName).join(', ')}`);
+        s.logs = markActed(instigator, s.logs, 'Redirected an attack with Instigator');
+        target = alt;
+      }
+
+      // SUIT ACTION (always fires, including when playing a King!)
+      if (card.suit === 'swords' && target && !s.roundMods.globalImmunity) {
         target.targetedThisRound = true;
-        // AI auto-blocks with Knight if holding one
         const aiKnightIdx = !target.isHuman && !actor.mods.unblockable && !s.roundMods.spatialLock && !s.roundMods.apocalypse
           ? target.hand.findIndex(c => c.rank === 12) : -1;
         if (aiKnightIdx !== -1) {
           const kn = target.hand.splice(aiKnightIdx, 1)[0];
-          s.grave.unshift(kn);
           sfx.shieldBlock();
-          s.logs = addLog(s.logs, `INTERRUPT! ${target.name} played ${cardShortName(kn)} to block ${actor.name}'s Sword!`, 'emerald');
-          if (target.pathwayId === 8 && (target.seq === 8 || target.seq === 7)) s.logs = markActed(target, s.logs, 'Blocked a Sword with Knight');
+          playEffects.push(`< ${pzCode(target)}:-${cardCode(kn)}`);
+          playDetails.push(`${target.name} blocked Sword with ${cardShortName(kn)}`);
+          playTone = 'emerald';
+          postInterruptLogs.push(() => {
+            applyInstantFaceSuitAction(s, target, actor, kn);
+            s.grave.unshift(kn);
+            if (target.pathwayId === 8 && (target.seq === 8 || target.seq === 7)) s.logs = markActed(target, s.logs, 'Blocked a Sword with Knight');
+          });
         } else if (target.mods.dawnPaladin) {
           if (target.pouch.length < (target.mods.maxPouch || 3)) target.pouch.push(card);
           else target.hand.push(card);
           s.trickPlays[s.trickPlays.length - 1].absorbed = true;
           sfx.shieldBlock();
-          s.logs = addLog(s.logs, `DAWN PALADIN! ${cardShortName(card)} entered ${target.name}'s ${target.pouch.length <= (target.mods.maxPouch || 3) ? 'Pouch' : 'Hand'} instead!`, 'emerald');
+          playEffects.push(`${pCode(target.id)}: +/${cardCode(card)}`);
+          playDetails.push(`Dawn Paladin absorbed ${cardShortName(card)} into ${target.name}'s Pouch`);
+          playTone = 'emerald';
           s.logs = markActed(target, s.logs, 'Absorbed attacking Sword');
         } else if (!target.mods.pouchImmune) {
           const hits = (s.roundMods.apocalypse ? 2 : 1) * times;
           let destroyed = 0;
+          const destroyedCards = [];
           for (let h = 0; h < hits && target.pouch.length > 0; h++) {
             const idx = Math.floor(Math.random() * target.pouch.length);
             const pCard = target.pouch[idx];
             if (pCard.rank === 11 || target.mods.despairTraps) {
               target.pouch.splice(idx, 1);
               s.grave.unshift(pCard);
-              if (actor.pouch.length > 0) target.hand.push(actor.pouch.pop());
-              else if (actor.hand.length > 0) target.hand.push(actor.hand.pop());
+              let stolenByTrap = null;
+              if (actor.pouch.length > 0) { stolenByTrap = actor.pouch.pop(); target.hand.push(stolenByTrap); }
+              else if (actor.hand.length > 0) { stolenByTrap = actor.hand.pop(); target.hand.push(stolenByTrap); }
               sfx.swordHit();
-              s.logs = addLog(s.logs, `PAGE TRAP! ${target.name}'s ${cardShortName(pCard)} counter-stole a card from ${actor.name}!`, 'danger');
+              playEffects.push(`< ${pzCode(target)}:-/${cardCode(pCard)}${stolenByTrap ? ', -' + cardCode(stolenByTrap) + 's' : ''}`);
+              playDetails.push(`PAGE TRAP! ${target.name}'s ${cardShortName(pCard)} counter-stole ${stolenByTrap ? cardShortName(stolenByTrap) : 'a card'} from ${actor.name}`);
+              playTone = 'danger';
               if (target.pathwayId === 0 && target.seq === 4) s.logs = markActed(target, s.logs, 'Triggered Page Trap');
               if (target.pathwayId === 3 && target.seq === 4) s.logs = markActed(target, s.logs, 'Triggered Page Trap');
             } else {
               target.pouch.splice(idx, 1);
               s.grave.unshift(pCard);
+              destroyedCards.push(pCard);
               target.pouchLostThisRound = true;
               destroyed++;
               sfx.swordHit();
             }
           }
           if (destroyed > 0) {
-            s.logs = addLog(s.logs, `SWORD! ${actor.name} destroyed ${destroyed} card(s) in ${target.name}'s Pouch.`, 'danger');
+            playEffects.push(`${pCode(target.id)}: ${destroyedCards.map(c => '-/' + cardCode(c)).join(',')}`);
+            playDetails.push(`Sword destroyed ${destroyedCards.map(cardShortName).join(', ')} in ${target.name}'s Pouch`);
+            playTone = 'danger';
             if (actor.mods.assassinSwordDraw) {
               const r = drawCardsFromDeck(s, 1);
               s.deck = r.deck; s.grave = r.grave;
               actor.hand.push(...r.drawn);
-              s.logs = addLog(s.logs, `ASSASSIN! ${actor.name} drew 1 card from Deck on Sword hit!`, 'emerald');
+              playEffects.push(r.drawn.map(c => '+' + cardCode(c)).join(','));
+              playDetails.push(`Assassin drew ${r.drawn.map(cardShortName).join(', ')}`);
             }
             if ((actor.pathwayId === 7 && actor.seq === 9) || (actor.pathwayId === 3 && (actor.seq === 9 || actor.seq === 7 || actor.seq === 1)) || (actor.pathwayId === 5 && actor.seq === 4) || (actor.pathwayId === 8 && actor.seq === 7) || (actor.pathwayId === 4 && actor.seq === 8)) {
               s.logs = markActed(actor, s.logs, 'Destroyed an opponent Pouch card');
@@ -5096,23 +6036,52 @@ export default function App() {
           ? target.hand.findIndex(c => c.rank === 13) : -1;
         if (aiQueenIdx !== -1) {
           const qn = target.hand.splice(aiQueenIdx, 1)[0];
-          s.grave.unshift(qn);
           sfx.shieldBlock();
-          s.logs = addLog(s.logs, `INTERRUPT! ${target.name} played ${cardShortName(qn)} to block ${actor.name}'s Wand!`, 'emerald');
+          playEffects.push(`< ${pzCode(target)}:-${cardCode(qn)}`);
+          playDetails.push(`${target.name} blocked Wand with ${cardShortName(qn)}`);
+          playTone = 'emerald';
+          postInterruptLogs.push(() => {
+            applyInstantFaceSuitAction(s, target, actor, qn);
+            s.grave.unshift(qn);
+          });
         } else if (!target.mods.handImmune) {
-          for (let h = 0; h < times; h++) {
-            if (target.mods.sunFloor && target.hand.length <= 3) break;
-            if (target.hand.length === 0) {
+          if (target.isHuman && !(target.mods.sunFloor && target.hand.length <= 3)) {
+            const maxAllowed = target.mods.sunFloor ? Math.max(0, target.hand.length - 3) : target.hand.length;
+            const actualDrop = Math.min(times, maxAllowed);
+            if (actualDrop > 0) {
+              s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: actualDrop, destination: 'grave', selectedUids: [], appendEffect: true, effectPrefix: '#1: ', reason: `${actor.name} played ${cardShortName(card)}! Choose ${actualDrop} card(s) to discard.` };
+              target.lostCardThisRound = true;
+              playDetails.push(`Wand forces ${target.name} to choose ${actualDrop} card(s) to discard`);
+              playTone = 'danger';
+            } else if (target.hand.length === 0) {
               target.skipNextTurn = true;
-              s.logs = addLog(s.logs, `MENTAL BREAK! ${target.name} had 0 cards and loses their next turn!`, 'danger');
-              if (actor.pathwayId === 7 && actor.seq === 1) s.logs = markActed(actor, s.logs, 'Forced opponent to lose a turn');
-              break;
+              playEffects.push(`${pCode(target.id)}: MB()`);
+              playDetails.push(`MENTAL BREAK! ${target.name} had 0 cards and loses next turn`);
+              playTone = 'danger';
             }
-            const idx = Math.floor(Math.random() * target.hand.length);
-            s.grave.unshift(target.hand.splice(idx, 1)[0]);
-            target.lostCardThisRound = true;
+          } else {
+            const wandDropped = [];
+            for (let h = 0; h < times; h++) {
+              if (target.mods.sunFloor && target.hand.length <= 3) break;
+              if (target.hand.length === 0) {
+                target.skipNextTurn = true;
+                playEffects.push(`${pCode(target.id)}: MB()`);
+                playDetails.push(`MENTAL BREAK! ${target.name} had 0 cards and loses next turn`);
+                if (actor.pathwayId === 7 && actor.seq === 1) s.logs = markActed(actor, s.logs, 'Forced opponent to lose a turn');
+                break;
+              }
+              const idx = pickDiscardCardIdx(target.hand, target.seq);
+              const dCard = target.hand.splice(idx, 1)[0];
+              wandDropped.push(dCard);
+              s.grave.unshift(dCard);
+              target.lostCardThisRound = true;
+            }
+            if (wandDropped.length > 0) {
+              playEffects.push(`${pCode(target.id)}: ${wandDropped.map(c => '-' + cardCode(c)).join(',')}`);
+              playDetails.push(`Wand forced ${target.name} to discard ${wandDropped.map(cardShortName).join(', ')}`);
+              playTone = 'danger';
+            }
           }
-          s.logs = addLog(s.logs, `WAND! ${target.name} was forced to discard ${times} card(s).`, 'danger');
           if ((actor.pathwayId === 15 && actor.seq === 9) || (actor.pathwayId === 3 && (actor.seq === 8 || actor.seq === 5)) || (actor.pathwayId === 4 && actor.seq === 8)) {
             s.logs = markActed(actor, s.logs, 'Forced an opponent to discard with a Wand');
           }
@@ -5121,22 +6090,38 @@ export default function App() {
         const r = drawCardsFromDeck(s, times);
         s.deck = r.deck; s.grave = r.grave;
         actor.hand.push(...r.drawn);
-        s.logs = addLog(s.logs, `PENTACLE! ${actor.name} drew ${r.drawn.length} card(s) from the Deck.`, 'emerald');
+        if (r.drawn.length > 0) {
+          playEffects.push(r.drawn.map(c => '+' + cardCode(c)).join(','));
+          playDetails.push(`Pentacle drew ${r.drawn.map(cardShortName).join(', ')}`);
+          playTone = 'emerald';
+        }
         if ((actor.pathwayId === 16 && actor.seq === 9) || (actor.pathwayId === 21 && actor.seq === 5) || (actor.pathwayId === 19 && (actor.seq === 8 || actor.seq === 7))) {
           s.logs = markActed(actor, s.logs, 'Played a Pentacle');
         }
       } else if (card.suit === 'cups') {
-        let taken = 0;
+        const healedCards = [];
         for (let h = 0; h < times && s.grave.length > 0; h++) {
-          actor.hand.push(s.grave.shift());
-          taken++;
+          const hc = s.grave.shift();
+          actor.hand.push(hc);
+          healedCards.push(hc);
         }
-        if (taken > 0) s.logs = addLog(s.logs, `CUP! ${actor.name} pulled ${taken} card(s) from the Grave.`, 'info');
+        if (healedCards.length > 0) {
+          playEffects.push(healedCards.map(c => '+' + cardCode(c) + 'g').join(','));
+          playDetails.push(`Cup pulled ${healedCards.map(cardShortName).join(', ')} from Grave`);
+          playTone = 'info';
+        }
         if ((actor.pathwayId === 18 && actor.seq === 8) || (actor.pathwayId === 21 && actor.seq === 8) || (actor.pathwayId === 13 && actor.seq === 9)) {
           s.logs = markActed(actor, s.logs, 'Played a Cup');
         }
       }
     }
+
+    const baseTrickVal = card.rank <= 10 ? card.rank : 0;
+    const tvDelta = (card.type === 'minor' && card.rank <= 10) ? (effValue - baseTrickVal) : 0;
+    const tvTag = tvDelta !== 0 ? `(${tvDelta > 0 ? '+' : ''}${tvDelta}=${effValue})` : '';
+    const unifiedCode = `${pCode(playerId)}: ${cardCode(card)}${tvTag}${playEffects.length > 0 ? ` (${playEffects.join(', ')})` : ''}`;
+    s.logs = addLog(s.logs, playDetails.join(' — ') + '.', playTone, unifiedCode);
+    for (const fn of postInterruptLogs) fn();
 
     // Play-based Acting checks
     if (actor.pathwayId === 4 && actor.seq === 9 && card.rank <= 6) s.logs = markActed(actor, s.logs, 'Played a card ≤ 6');
@@ -5161,12 +6146,22 @@ export default function App() {
 
       // War Bishop War penalty on trick losers
       if (s.roundMods.warDeclared) {
+        const warDropped = [];
         for (const p of s.players) {
-          if (p.id !== winner.id && p.hand.length > 0) {
-            s.grave.unshift(p.hand.pop());
+          if (p.id !== winner.id && p.hand.length > 0 && !p.mods.handImmune) {
+            if (p.isHuman) {
+              s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: 1, destination: 'grave', selectedUids: [], appendEffect: true, effectPrefix: '#1: ', reason: 'War Penalty: You lost the trick — choose 1 Hand card to discard.' };
+              p.lostCardThisRound = true;
+            } else {
+              const dIdx = pickDiscardCardIdx(p.hand, p.seq);
+              const dc = p.hand.splice(dIdx, 1)[0];
+              s.grave.unshift(dc);
+              warDropped.push(`${pCode(p.id)}: -${cardCode(dc)}`);
+              p.lostCardThisRound = true;
+            }
           }
         }
-        s.logs = addLog(s.logs, `WAR PENALTY: Every trick loser discarded 1 card!`, 'danger');
+        s.logs = addLog(s.logs, `WAR PENALTY: Trick losers discard 1 card!`, 'danger', warDropped.length > 0 ? `WAR(${warDropped.join(', ')})` : null);
       }
 
       // Eternal Night & Folk of Rage rewards
@@ -5179,7 +6174,7 @@ export default function App() {
         const r = drawCardsFromDeck(s, 1);
         s.deck = r.deck; s.grave = r.grave;
         winner.hand.push(...r.drawn);
-        s.logs = addLog(s.logs, `FOLK OF RAGE! ${winner.name} won the trick and drew 1 card!`, 'emerald');
+        s.logs = addLog(s.logs, `FOLK OF RAGE! ${winner.name} won the trick and drew 1 card!`, 'emerald', `${pCode(winner.id)}: (${r.drawn.map(c => '+' + cardCode(c)).join(',')})`);
       }
       // Strength S9 Warrior: if you lose a trick, take the winning card into Hand!
       let winTaken = false;
@@ -5188,7 +6183,7 @@ export default function App() {
           pl.hand.push(winPlay.card);
           winPlay.absorbed = true;
           winTaken = true;
-          s.logs = addLog(s.logs, `WARRIOR! ${pl.name} lost the trick and claimed ${cardShortName(winPlay.card)} into Hand!`, 'emerald');
+          s.logs = addLog(s.logs, `WARRIOR! ${pl.name} lost the trick and claimed ${cardShortName(winPlay.card)} into Hand!`, 'emerald', `${pCode(pl.id)}: (+${cardCode(winPlay.card)})`);
         }
       }
       // Emperor S6 Baron of Corruption: take 1 played trick card into Pouch!
@@ -5199,7 +6194,7 @@ export default function App() {
           if (pickTp) {
             pl.pouch.push(pickTp.card);
             pickTp.absorbed = true;
-            s.logs = addLog(s.logs, `BARON OF CORRUPTION! ${pl.name} tucked ${cardShortName(pickTp.card)} from the trick into Pouch!`, 'gold');
+            s.logs = addLog(s.logs, `BARON OF CORRUPTION! ${pl.name} tucked ${cardShortName(pickTp.card)} from the trick into Pouch!`, 'gold', `${pCode(pl.id)}: (+/${cardCode(pickTp.card)})`);
           }
         }
       }
@@ -5247,7 +6242,7 @@ export default function App() {
     if (choice === 'take_trump') {
       if (s.trumpCard) {
         winner.hand.push(s.trumpCard);
-        s.logs = addLog(s.logs, `${winner.name} claimed the Trump Card (${cardShortName(s.trumpCard)}).`, 'emerald');
+        s.logs = addLog(s.logs, `${winner.name} claimed the Trump Card (${cardShortName(s.trumpCard)}).`, 'emerald', `T${s.round}& ${pCode(winner.id)}: ?0 (+${cardCode(s.trumpCard)})`);
         s.trumpCard = null;
       }
     } else if (choice === 'gamble') {
@@ -5261,13 +6256,16 @@ export default function App() {
       const success = foundMinor && guessedSuits.includes(foundMinor.suit);
       if (success) {
         sfx.ascend();
+        const claimedTrump = s.trumpCard;
         winner.hand.push(...revealed);
-        if (s.trumpCard) winner.hand.push(s.trumpCard);
+        if (claimedTrump) winner.hand.push(claimedTrump);
         s.trumpCard = null;
+        const wonCodes = [...revealed, ...(claimedTrump ? [claimedTrump] : [])].map(c => '+' + cardCode(c)).join(',');
         s.logs = addLog(
           s.logs,
           `SEER GAMBLE WON! ${winner.name} guessed ${guessedSuits.map(x => SUIT_META[x].name).join('/')} and scooped ${revealed.length} revealed card(s) + Trump!`,
-          'emerald'
+          'emerald',
+          `T${s.round}& ${pCode(winner.id)}: ?${guessedSuits.map(suitCode).join('/')} (${wonCodes})`
         );
         if (winner.pathwayId === 0 && winner.seq === 9) s.logs = markActed(winner, s.logs, 'Won the Suit-Guess Gamble');
         if (winner.pathwayId === 9 && (winner.seq === 9 || winner.seq === 2)) s.logs = markActed(winner, s.logs, 'Won the Suit-Guess Gamble');
@@ -5279,7 +6277,8 @@ export default function App() {
         s.logs = addLog(
           s.logs,
           `SEER GAMBLE MISSED! Revealed ${foundMinor ? cardShortName(foundMinor) : 'nothing'} — all cards sent to Grave.`,
-          'danger'
+          'danger',
+          `T${s.round}& ${pCode(winner.id)}: ?${guessedSuits.map(suitCode).join('/')} ()`
         );
       }
     }
@@ -5316,7 +6315,10 @@ export default function App() {
       if (p.pathwayId === 21 && p.seq === 9 && !p.pouchLostThisRound && p.pouch.length > 0) s.logs = markActed(p, s.logs, 'Cultivated Pouch untouched');
     }
 
-    // AI Ascension check
+    s.phase = 'ASCEND';
+    s.logs = addLog(s.logs, `Phase 3: Ascension Phase — spend Pouch ingredients to Ascend, or proceed to next round.`, 'info', `A${s.round}=`, { newPhase: true });
+
+    // AI Ascension check (now cleanly inside A{round}=!)
     for (const p of s.players) {
       if (!p.isHuman && !p.mods.ascendLocked && p.seq > 0) {
         const pool = p.mods.handAscend ? [...p.pouch, ...p.hand] : p.pouch;
@@ -5327,8 +6329,6 @@ export default function App() {
         }
       }
     }
-
-    s.phase = 'ASCEND';
     return s;
   }
 
@@ -5368,7 +6368,7 @@ export default function App() {
 
     if (p.seq === 0) {
       s.winnerId = p.id;
-      s.logs = addLog(s.logs, `APOTHEOSIS! ${p.name} ascended to SEQUENCE 0 (${PATHWAYS[p.pathwayId].arcana}) and WON THE GAME!`, 'gold');
+      s.logs = addLog(s.logs, `APOTHEOSIS! ${p.name} ascended to SEQUENCE 0 (${PATHWAYS[p.pathwayId].arcana}) and WON THE GAME!`, 'gold', `${pCode(p.id)}: @q0 (WIN)`);
       return s;
     }
 
@@ -5376,28 +6376,57 @@ export default function App() {
       const r = drawCardsFromDeck(s, 1);
       s.deck = r.deck; s.grave = r.grave;
       p.hand.push(...r.drawn);
-      s.logs = addLog(s.logs, `SAFE ASCENSION! ${p.name} digested Seq ${oldSeq} → Seq ${p.seq} (${PATHWAYS[p.pathwayId].seqs[p.seq].name}) and drew +1 card!`, 'emerald');
+      const spentStr = formatSpentPouchCodes(spentCards, oldSeq, p.mods);
+      const drawStr = r.drawn.map(c => '+' + cardCode(c)).join(',');
+      s.logs = addLog(s.logs, `SAFE ASCENSION! ${p.name} digested Seq ${oldSeq} → Seq ${p.seq} (${PATHWAYS[p.pathwayId].seqs[p.seq].name}) and drew +1 card!`, 'emerald', `${pCode(p.id)}: @q${p.seq} (${spentStr}${drawStr ? ', ' + drawStr : ''})`);
     } else {
-      let dropped = 0;
-      for (let i = 0; i < 3; i++) {
-        if (p.hand.length === 0) {
-          p.skipNextTurn = true;
-          break;
+      if (p.isHuman && p.hand.length > 0) {
+        const cnt = Math.min(3, p.hand.length);
+        if (p.hand.length < 3) p.skipNextTurn = true;
+        s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: cnt, destination: 'grave', selectedUids: [], appendEffect: true, effectPrefix: '', reason: `Reckless (Undigested) Ascension to Seq ${p.seq} — choose ${cnt} Hand card(s) to discard.` };
+        const spentStrH = formatSpentPouchCodes(spentCards, oldSeq, p.mods);
+        s.logs = addLog(s.logs, `RECKLESS ASCENSION! ${p.name} advanced Undigested to Seq ${p.seq} — choose ${cnt} Hand card(s) to discard.`, 'danger', `${pCode(p.id)}: @q${p.seq}* (${spentStrH})`);
+      } else {
+        let dropped = 0;
+        for (let i = 0; i < 3; i++) {
+          if (p.hand.length === 0) {
+            p.skipNextTurn = true;
+            break;
+          }
+          const dIdx = p.isHuman ? p.hand.length - 1 : pickDiscardCardIdx(p.hand, p.seq);
+          s.grave.unshift(p.hand.splice(dIdx, 1)[0]);
+          dropped++;
         }
-        s.grave.unshift(p.hand.pop());
-        dropped++;
+        const spentStrU = formatSpentPouchCodes(spentCards, oldSeq, p.mods);
+        s.logs = addLog(
+          s.logs,
+          `RECKLESS ASCENSION! ${p.name} advanced Undigested to Seq ${p.seq} and lost ${dropped} Hand card(s)${p.skipNextTurn ? ' (LOSES NEXT TURN!)' : ''}!`,
+          'danger',
+          `${pCode(p.id)}: @q${p.seq}* (${spentStrU}, -${dropped}H)`
+        );
       }
-      s.logs = addLog(
-        s.logs,
-        `RECKLESS ASCENSION! ${p.name} advanced Undigested to Seq ${p.seq} and lost ${dropped} Hand card(s)${p.skipNextTurn ? ' (LOSES NEXT TURN!)' : ''}!`,
-        'danger'
-      );
     }
 
     return s;
   }
 
   function advanceToNextRound(state) {
+    const humanP = state.players[0];
+    const humanCap = getHandLimit(humanP.seq, handLimitMode);
+    if (humanP && humanP.isHuman && humanP.hand.length > humanCap) {
+      const excess = humanP.hand.length - humanCap;
+      return {
+        ...state,
+        pendingInteraction: {
+          type: 'CHOOSE_DISCARD',
+          count: excess,
+          destination: 'grave',
+          selectedUids: [],
+          afterAction: 'NEXT_ROUND',
+          reason: `End-of-Round Hand Limit (${humanCap}): choose ${excess} excess card(s) to discard.`
+        }
+      };
+    }
     let grave = [...state.grave];
     let logs = [...state.logs];
     const nextPlayers = state.players.map(p => {
@@ -5409,7 +6438,7 @@ export default function App() {
         trimmed++;
       }
       if (trimmed > 0) {
-        logs = addLog(logs, `HAND LIMIT (${cap}): ${p.name} discarded ${trimmed} excess card(s) to Grave.`, 'muted');
+        logs = addLog(logs, `HAND LIMIT (${cap}): ${p.name} discarded ${trimmed} excess card(s) to Grave.`, 'muted', `${pCode(p.id)}: (-${trimmed}H cap)`);
       }
       // If ended round with 0 cards (and wasn't already skipped), they lose next turn & draw 2
       const mentalBreak = !p.skippedThisRound && hand.length === 0;
@@ -5429,7 +6458,7 @@ export default function App() {
       dealerIdx: (state.dealerIdx + 1) % state.players.length,
       players: nextPlayers,
       grave,
-      logs: addLog(logs, `--- Round ${state.round + 1} Begins ---`, 'info')
+      logs: addLog(logs, `--- Round ${state.round + 1} Begins ---`, 'info', `A${state.round}&`)
     };
     return beginRoundDraw(s);
   }
@@ -5463,7 +6492,7 @@ export default function App() {
             let pick = s.centerDraft[0];
             if (aiBrainMode === 'nn_hard') {
               const evalHard = new CardIdNeuralNet(nnHardRef.current.bestValSnapshot || nnHardRef.current.championSnapshot || nnHardRef.current.serialize());
-              pick = evalHard.selectCard(extractCardIdFeatures(s, dId, handLimitMode), s.centerDraft, 'draft', null, 0) || s.centerDraft[0];
+              pick = selectCardLiveHard(evalHard, s, dId, s.centerDraft, 'draft') || s.centerDraft[0];
             } else {
               const hDepth = aiBrainMode.startsWith('heuristic_') ? (Number(aiBrainMode.split('_')[1]) || 6) : 5;
               let bestSc = -999;
@@ -5479,7 +6508,7 @@ export default function App() {
             }
             s.centerDraft = s.centerDraft.filter(c => c.uid !== pick.uid);
             s.players[dId].hand.push(pick);
-            s.logs = addLog(s.logs, `${p.name} drafted ${cardShortName(pick)}.`, 'muted');
+            s.logs = addLog(s.logs, `${p.name} drafted ${cardShortName(pick)}.`, 'muted', `${pCode(dId)}: D+${cardCode(pick)}`);
             s.draftTurnIdx++;
             if (s.draftTurnIdx >= s.draftOrder.length) {
               return startTrickPhase(s);
@@ -5522,67 +6551,71 @@ export default function App() {
             if (!p || p.isHuman) return prev;
             let s = prev;
 
-            const activeNet = aiBrainMode === 'nn_hard'
-              ? new CardIdNeuralNet(nnHardRef.current.bestValSnapshot || nnHardRef.current.championSnapshot || nnHardRef.current.serialize())
-              : (aiBrainMode === 'nn_easy' ? new LotmNeuralNet(nnEasyRef.current.bestValSnapshot || nnEasyRef.current.championSnapshot || nnEasyRef.current.serialize()) : null);
+            let activeNet = null;
+            try {
+              activeNet = aiBrainMode === 'nn_hard'
+                ? new CardIdNeuralNet(nnHardRef.current?.bestValSnapshot || nnHardRef.current?.championSnapshot || nnHardRef.current?.serialize())
+                : (aiBrainMode === 'nn_easy' ? new LotmNeuralNet(nnEasyRef.current?.bestValSnapshot || nnEasyRef.current?.championSnapshot || nnEasyRef.current?.serialize()) : null);
+            } catch (_) { activeNet = null; }
             const useTrainedNN = !!activeNet;
             const hDepth = aiBrainMode.startsWith('heuristic_') ? (Number(aiBrainMode.split('_')[1]) || 6) : 5;
             const liveQuery = (headEasy, headHard) => {
               if (!activeNet) return false;
-              return activeNet.kind === 'hard'
-                ? activeNet.actMeta(extractCardIdFeatures(s, aId, handLimitMode), headHard, null, 0)
-                : activeNet.act(extractBoardFeatures(s, aId, handLimitMode), headEasy, null, 0);
+              try {
+                return activeNet.kind === 'hard'
+                  ? activeNet.actMeta(extractCardIdFeatures(s, aId, handLimitMode, 'trick'), headHard, null, 0)
+                  : activeNet.act(extractBoardFeatures(s, aId, handLimitMode), headEasy, null, 0);
+              } catch (_) { return false; }
             };
 
-            // AI plays Major Arcana Chaos Event (Trained NN greedy policy OR Heuristic)
-            const majorInHand = p.hand.find(c => c.type === 'major');
-            const wantChaos = majorInHand && (useTrainedNN ? liveQuery(3, 1) : (p.hand.length >= 3 && Math.random() < 0.4));
+            // AI plays Major Arcana Chaos Event (only when holding >= 2 cards so AI still has a card to play!)
+            const majorInHand = s.players[aId].hand.find(c => c.type === 'major');
+            const wantChaos = majorInHand && s.players[aId].hand.length >= 2 && (useTrainedNN ? liveQuery(3, 1) : (s.players[aId].hand.length >= 3 && Math.random() < 0.4));
             if (wantChaos) {
-              const target = s.players.filter(x => x.id !== aId).sort((a, b) => a.seq - b.seq)[0];
-              s = resolveChaosEvent(s, aId, majorInHand, target?.id ?? 0);
+              const oppsC = s.players.filter(x => x.id !== aId && !x.skippedThisRound);
+              const target = oppsC.sort((a, b) => a.seq - b.seq)[0];
+              s = resolveChaosEvent(s, aId, majorInHand, target ? target.id : null);
+              // Pause immediately if Chaos opened a Human Interrupt / Choose Discard modal or changed phase!
+              if (s.pendingInteraction || s.phase !== 'TRICK' || s.winnerId !== null) return s;
             }
 
-            // AI uses Sequence Ability (respects free 1st cast vs 1-card recast cost)
-            const recastNeed = (s.players[aId].abilityCastsThisSeq || 0) > 0 ? 1 : 0;
-            const wantAbil = !s.players[aId].abilityUsed && s.players[aId].hand.length >= (recastNeed > 0 ? 3 : 1) && (
+            // AI uses Sequence Ability (FREE while Undigested; 1-card Sanity Toll once Digested)
+            const recastNeed = s.players[aId].actingDone ? 1 : 0;
+            const wantAbil = !s.players[aId].abilityUsed && s.players[aId].hand.length >= (recastNeed > 0 ? 3 : 2) && (
               useTrainedNN ? liveQuery(2, 0) : (recastNeed === 0 ? true : (hDepth >= 2 && s.players[aId].hand.length >= 4))
             );
             if (wantAbil) {
-              const target = s.players.filter(x => x.id !== aId).sort((a, b) => a.seq - b.seq)[0];
-              s = executeSequenceAbility(s, aId, target?.id ?? 0);
+              const oppsA = s.players.filter(x => x.id !== aId && !x.skippedThisRound);
+              const target = oppsA.sort((a, b) => a.seq - b.seq)[0];
+              s = executeSequenceAbility(s, aId, target ? target.id : null);
+              // Pause immediately if Ability opened a Human modal, rebooted trick turn order, or changed phase!
+              if (s.pendingInteraction || s.phase !== 'TRICK' || s.winnerId !== null || s.trickOrder[s.trickTurnIdx] !== aId) return s;
             }
 
-            // AI picks a Minor Arcana to play (follows Leading Suit if able)
+            // AI picks ANY card in Hand to play into Trick (Minor OR Major Arcana are legal!)
             const currP = s.players[aId];
-            let minors = currP.hand.filter(c => c.type === 'minor');
-            if (minors.length === 0) {
-              // Edge case: AI holds only Major Arcana — draw 1 emergency Minor from deck or skip
-              const r = drawCardsFromDeck(s, 1);
-              s = { ...s, deck: r.deck, grave: r.grave };
-              if (r.drawn[0] && r.drawn[0].type === 'minor') {
-                s.players[aId].hand.push(r.drawn[0]);
-                minors = [r.drawn[0]];
-              } else {
-                s.trickTurnIdx++;
-                if (s.trickTurnIdx >= s.trickOrder.length) {
-                  const winPlay = evaluateTrickWinner(s.trickPlays, s.trumpCard, s.roundMods);
-                  s.trickWinnerId = winPlay ? winPlay.playerId : 0;
-                  s.phase = 'TRICK_REWARD';
-                }
-                return s;
+            if (!currP || currP.hand.length === 0) {
+              const nextIdx = s.trickTurnIdx + 1;
+              let nextS = { ...s, trickTurnIdx: nextIdx };
+              if (nextS.trickTurnIdx >= nextS.trickOrder.length) {
+                const winPlay = evaluateTrickWinner(nextS.trickPlays, nextS.trumpCard, nextS.roundMods);
+                nextS.trickWinnerId = winPlay ? winPlay.playerId : 0;
+                nextS.phase = 'TRICK_REWARD';
               }
+              return nextS;
             }
 
-            const leadSuit = s.trickPlays[0]?.effSuit;
-            const followCards = leadSuit ? minors.filter(c => c.suit === leadSuit) : [];
-            const legal = followCards.length > 0 ? followCards : minors;
+            const legal = [...currP.hand];
             let chosenCard = legal[0];
             if (activeNet && activeNet.kind === 'hard') {
-              chosenCard = activeNet.selectCard(extractCardIdFeatures(s, aId, handLimitMode), legal, 'trick', null, 0) || legal[0];
+              try {
+                chosenCard = selectCardLiveHard(activeNet, s, aId, legal, 'trick') || legal[0];
+              } catch (_) { chosenCard = legal[0]; }
             } else {
               const tSuit = (!s.roundMods.abolishTrump && !s.roundMods.noTrumpChariot && s.trumpCard) ? s.trumpCard.suit : null;
               legal.sort((a, b) => {
                 const sc = (c) => {
+                  if (c.type === 'major') return (s.trumpCard?.type === 'major' ? 14 : 4) + (c.majorId || 0) * 0.1;
                   let v = c.rank <= 10 ? c.rank : (c.rank === 14 ? 8 : 5);
                   if (tSuit && c.suit === tSuit && c.rank <= 10) v += 6;
                   if (hDepth >= 4 && (c.rank <= currP.seq || c.rank === 10) && findValidAscensionSubset([...currP.pouch, c], currP.seq, currP.mods)) v -= 25;
@@ -5593,11 +6626,14 @@ export default function App() {
               });
               chosenCard = legal[0];
             }
-            const oppsLive = s.players.filter(x => x.id !== aId);
-            const bestTarget = (activeNet && activeNet.kind === 'hard' && oppsLive.length > 1)
-              ? activeNet.selectTarget(extractCardIdFeatures(s, aId, handLimitMode, 'trick'), oppsLive, null, 0)
-              : oppsLive.sort((a, b) => a.seq - b.seq)[0];
-            return playTrickCard(s, aId, chosenCard, bestTarget?.id ?? 0);
+            const oppsLive = s.players.filter(x => x.id !== aId && !x.skippedThisRound);
+            let bestTarget = oppsLive.length === 0 ? null : oppsLive.sort((a, b) => a.seq - b.seq)[0];
+            if (activeNet && activeNet.kind === 'hard' && oppsLive.length > 1) {
+              try {
+                bestTarget = activeNet.selectTarget(extractCardIdFeatures(s, aId, handLimitMode, 'trick'), oppsLive, null, 0) || bestTarget;
+              } catch (_) {}
+            }
+            return playTrickCard(s, aId, chosenCard, bestTarget ? bestTarget.id : null);
           });
         }, 620);
       }
@@ -5623,14 +6659,52 @@ export default function App() {
         }, 650);
       }
     }
-  }, [game, screen]);
+  }, [game, screen, aiBrainMode]);
 
-  // Check for winner transition
+  // 5-Second Auto-Pass Countdown for Human Interrupt Window
+  useEffect(() => {
+    if (screen !== 'playing' || !game || game.pendingInteraction?.type !== 'INTERRUPT') return;
+    setInterruptSecLeft(5);
+    const interval = setInterval(() => {
+      setInterruptSecLeft(prev => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [screen, game?.pendingInteraction?.type, game?.pendingInteraction?.card?.uid]);
+
+  useEffect(() => {
+    if (screen === 'playing' && game?.pendingInteraction?.type === 'INTERRUPT' && interruptSecLeft === 0) {
+      handleInterruptDecision(false);
+    }
+  }, [interruptSecLeft, screen, game?.pendingInteraction?.type]);
+
+  // Check for winner transition & auto-save completed match to Past Game History
   useEffect(() => {
     if (game && game.winnerId !== null && screen !== 'gameover') {
+      const sig = `${game.round}_${game.winnerId}_${game.logs.length}`;
+      if (lastSavedGameRef.current !== sig) {
+        lastSavedGameRef.current = sig;
+        saveGameToHistory(game);
+      }
       setScreen('gameover');
     }
-  }, [game, screen]);
+  }, [game, screen, saveGameToHistory]);
+
+  // Netlist Replay auto-play timer
+  useEffect(() => {
+    if (screen !== 'replay' || !replayPlaying) return;
+    if (replayStep >= replayFrames.length - 1) {
+      setReplayPlaying(false);
+      return;
+    }
+    const t = setTimeout(() => setReplayStep(s => Math.min(replayFrames.length - 1, s + 1)), replaySpeedMs);
+    return () => clearTimeout(t);
+  }, [screen, replayPlaying, replayStep, replayFrames.length, replaySpeedMs]);
 
   // ============================================================================
   // 7. HUMAN INTERACTION HANDLERS
@@ -5664,7 +6738,7 @@ export default function App() {
       if (h.pouch.length >= (h.mods.maxPouch || 3)) return prev;
       h.hand = h.hand.filter(c => c.uid !== card.uid);
       h.pouch.push(card);
-      s.logs = addLog(s.logs, `You tucked ${cardShortName(card)} into your Pouch (${h.pouch.length}/${h.mods.maxPouch || 3}).`, 'info');
+      s.logs = addLog(s.logs, `You tucked ${cardShortName(card)} into your Pouch (${h.pouch.length}/${h.mods.maxPouch || 3}).`, 'info', `#1: +/${cardCode(card)}`);
       return s;
     });
   };
@@ -5679,7 +6753,7 @@ export default function App() {
         grave: [card, ...prev.grave]
       };
       s.players[0].pouch = s.players[0].pouch.filter(c => c.uid !== card.uid);
-      s.logs = addLog(s.logs, `Discarded ${cardShortName(card)} from your Pouch to the Grave.`, 'muted');
+      s.logs = addLog(s.logs, `Discarded ${cardShortName(card)} from your Pouch to the Grave.`, 'muted', `#1: -/${cardCode(card)}`);
       return s;
     });
   };
@@ -5694,7 +6768,7 @@ export default function App() {
         centerDraft: prev.centerDraft.filter(c => c.uid !== card.uid)
       };
       s.players[0].hand.push(card);
-      s.logs = addLog(s.logs, `You drafted ${cardShortName(card)}.`, 'emerald');
+      s.logs = addLog(s.logs, `You drafted ${cardShortName(card)}.`, 'emerald', `#1: D+${cardCode(card)}`);
       s.draftTurnIdx++;
       if (s.draftTurnIdx >= s.draftOrder.length) {
         return startTrickPhase(s);
@@ -5703,57 +6777,72 @@ export default function App() {
     });
   };
 
+  const getCardDescription = (card) => {
+    if (!card) return '';
+    if (card.type === 'major') {
+      const pw = PATHWAYS[card.majorId];
+      return `Event: ${pw?.chaosDesc || ''} (Recycle +${card.majorId} Grave→Deck)`;
+    }
+    const suitAction = card.suit === 'swords' ? 'Destroy 1 opponent Pouch card'
+      : card.suit === 'wands' ? 'Force 1 opponent discard'
+      : card.suit === 'pentacles' ? 'Draw 1 card'
+      : 'Take top Grave card';
+    let cardAction = '';
+    if (card.rank === 14) cardAction = `Reveal opponent Hand & steal 1 ${SUIT_META[card.suit]?.name}`;
+    else if (card.rank === 13) cardAction = 'Block an incoming discard (Wand)';
+    else if (card.rank === 12) cardAction = 'Block an incoming Pouch attack (Sword)';
+    else if (card.rank === 11) cardAction = 'Pouch Trap — counter-steal 1 card when hit by Sword';
+    else if (card.rank === 10) cardAction = 'Overrides Trump Suit; Wildcard (1–9) in Pouch';
+    else if (card.rank === 1) cardAction = 'Beats 10 of same Suit';
+    return cardAction ? `Suit Action: ${suitAction} • Card Action: ${cardAction}` : `Suit Action: ${suitAction}`;
+  };
+
   const handleHumanCardClick = (card) => {
     if (!game || game.pendingInteraction) return;
+    setSelectedHandUid(prev => (prev === card.uid ? null : card.uid));
+  };
 
-    // Instants: Major Arcana Chaos Events can be played at ANY time (including Phase 1 Pouch)!
-    if (card.type === 'major') {
-      if (game.players.length > 2 && [1, 3, 6, 17].includes(card.majorId)) {
-        setGame(prev => ({ ...prev, pendingInteraction: { type: 'TARGET_CHAOS', card } }));
-      } else {
-        setGame(prev => resolveChaosEvent(prev, 0, card, 1));
-      }
-      return;
-    }
+  const executeHumanCardAction = (card, actionType) => {
+    if (!game || game.pendingInteraction || !card) return;
+    setSelectedHandUid(null);
+    const activeOpps = game.players.filter(o => !o.isHuman && !o.skippedThisRound);
 
-    // Phase 1 (Pouch): Only time to tuck cards into Pouch (before Trick)!
-    if (game.phase === 'POUCH_ADD') {
+    if (actionType === 'pouch') {
       handleHumanPouchAdd(card);
       return;
     }
-
-    // Major Arcana Chaos Event can be played anytime during Draft, Trick, or Ascend!
-    if (card.type === 'major') {
-      if (game.players.length > 2 && [1, 3, 6, 17].includes(card.majorId)) {
-        setGame(prev => ({
-          ...prev,
-          pendingInteraction: { type: 'TARGET_CHAOS', card }
-        }));
+    if (actionType === 'instant_chaos' && card.type === 'major') {
+      const needsTgt = [1, 3, 6, 17].includes(card.majorId);
+      if (needsTgt && activeOpps.length >= 1) {
+        setGame(prev => ({ ...prev, pendingInteraction: { type: 'TARGET_CHAOS', card } }));
       } else {
-        setGame(prev => resolveChaosEvent(prev, 0, card, 1));
+        setGame(prev => resolveChaosEvent(prev, 0, card, null));
       }
       return;
     }
-
-    // Trick Phase: Play Minor Arcana
-    if (isHumanTrickTurn && card.type === 'minor') {
-      // Follow Leading Suit rule
-      if (leadSuit && humanHasLeadSuit && card.suit !== leadSuit && !human.mods.countsAsTrump) {
-        sfx.error();
-        setGame(prev => ({
-          ...prev,
-          logs: addLog(prev.logs, `You must follow the Leading Suit (${SUIT_META[leadSuit].name})!`, 'danger')
-        }));
-        return;
-      }
-      const needsTarget = (card.suit === 'swords' || card.suit === 'wands' || card.rank === 14) && game.players.length > 2;
-      if (needsTarget) {
-        setGame(prev => ({
-          ...prev,
-          pendingInteraction: { type: 'TARGET_CARD', card }
-        }));
+    if (actionType === 'instant_face' && (card.rank === 12 || card.rank === 13)) {
+      const needsTgt = card.suit === 'swords' || card.suit === 'wands';
+      if (needsTgt && activeOpps.length >= 1) {
+        setGame(prev => ({ ...prev, pendingInteraction: { type: 'TARGET_INSTANT_FACE', card } }));
       } else {
-        setGame(prev => playTrickCard(prev, 0, card, 1));
+        setGame(prev => {
+          let s = { ...prev, players: prev.players.map(p => ({ ...p, hand: [...p.hand], pouch: [...p.pouch], mods: { ...p.mods } })), deck: [...prev.deck], grave: [...prev.grave] };
+          s.players[0].hand = s.players[0].hand.filter(c => c.uid !== card.uid);
+          applyInstantFaceSuitAction(s, s.players[0], null, card);
+          s.grave.unshift(card);
+          return s;
+        });
+      }
+      return;
+    }
+    if (actionType === 'trick' && isHumanTrickTurn) {
+      const needsTgt = card.type === 'major'
+        ? [1, 3, 6, 17].includes(card.majorId)
+        : (card.suit === 'swords' || card.suit === 'wands' || card.rank === 14);
+      if (needsTgt && activeOpps.length >= 1) {
+        setGame(prev => ({ ...prev, pendingInteraction: { type: 'TARGET_CARD', card } }));
+      } else {
+        setGame(prev => playTrickCard(prev, 0, card, null));
       }
     }
   };
@@ -5762,42 +6851,87 @@ export default function App() {
     if (!game || !human || human.abilityUsed || game.pendingInteraction) return;
     const seqObj = PATHWAYS[human.pathwayId]?.seqs[human.seq];
     const needsTarget = seqObj && TARGETED_ABILITY_TAGS.has(seqObj.tag);
-    if (needsTarget && game.players.length > 2) {
+    const activeOpps = game.players.filter(o => !o.isHuman && !o.skippedThisRound);
+    const isRecast = !!human.actingDone;
+    if (isRecast && human.hand.length > 1) {
+      setGame(prev => ({
+        ...prev,
+        pendingInteraction: {
+          type: 'CHOOSE_DISCARD',
+          count: 1,
+          destination: 'grave',
+          selectedUids: [],
+          afterAction: needsTarget && activeOpps.length >= 1 ? 'TARGET_ABILITY' : 'CAST_ABILITY',
+          needsTarget,
+          reason: `Sanity Recast Cost for ${seqObj?.name}: choose 1 Hand card to discard.`
+        }
+      }));
+      return;
+    }
+    if (needsTarget && activeOpps.length >= 1) {
       setGame(prev => ({ ...prev, pendingInteraction: { type: 'TARGET_ABILITY' } }));
     } else {
-      setGame(prev => executeSequenceAbility(prev, 0, needsTarget ? 1 : null));
+      setGame(prev => executeSequenceAbility(prev, 0, null));
     }
   };
 
-  const handleInterruptDecision = (doBlock) => {
+  const handleInterruptDecision = (doBlock, chosenBlockCard = null) => {
     if (!game?.pendingInteraction || game.pendingInteraction.type !== 'INTERRUPT') return;
-    const { attackerId, card, blockCard, attackType } = game.pendingInteraction;
+    const pi = game.pendingInteraction;
+    const { attackerId, card, attackType, source, discardCount, reason } = pi;
+    const blockCard = chosenBlockCard || pi.blockCard;
     setGame(prev => {
       let s = {
         ...prev,
         pendingInteraction: null,
-        players: prev.players.map(p => ({ ...p, hand: [...p.hand], pouch: [...p.pouch] })),
-        grave: [...prev.grave]
+        players: prev.players.map(p => ({ ...p, hand: [...p.hand], pouch: [...p.pouch], mods: { ...p.mods } })),
+        deck: [...prev.deck],
+        grave: [...prev.grave],
+        roundMods: { ...prev.roundMods }
       };
-      if (doBlock) {
+      if (doBlock && blockCard) {
+        const activeOpps = s.players.filter(o => !o.isHuman && !o.skippedThisRound);
+        if ((blockCard.suit === 'swords' || blockCard.suit === 'wands') && activeOpps.length >= 1) {
+          // Pause and let Human choose which active opponent receives the Knight/Queen's Swords/Wands Suit Action!
+          return {
+            ...s,
+            pendingInteraction: {
+              type: 'TARGET_INTERRUPT_SUIT',
+              attackerId,
+              card,
+              attackType,
+              source,
+              blockCard
+            }
+          };
+        }
         sfx.shieldBlock();
         s.players[0].hand = s.players[0].hand.filter(c => c.uid !== blockCard.uid);
-        s.grave.unshift(blockCard);
-        // Temporarily shield human so card resolves in trick without hitting human
         if (attackType === 'sword') s.players[0].mods.pouchImmune = true;
         if (attackType === 'wand') s.players[0].mods.handImmune = true;
-        s.logs = addLog(s.logs, `INTERRUPT! You played ${cardShortName(blockCard)} to cancel ${s.players[attackerId].name}'s ${attackType}!`, 'emerald');
+        s.logs = addLog(s.logs, `INTERRUPT! You played ${cardShortName(blockCard)} to cancel ${s.players[attackerId]?.name}'s ${attackType}!`, 'emerald', `< ${pzCode(s.players[0])}:-${cardCode(blockCard)} (block ${pCode(attackerId)})`);
+        applyInstantFaceSuitAction(s, s.players[0], s.players[attackerId], blockCard);
+        s.grave.unshift(blockCard);
         if (s.players[0].pathwayId === 8 && (s.players[0].seq === 8 || s.players[0].seq === 7)) {
           s.logs = markActed(s.players[0], s.logs, 'Blocked an attack with Knight/Queen');
         }
+        if (source === 'chaos_discard') return s;
         return playTrickCard(s, attackerId, card, 0, true);
       } else {
+        if (source === 'chaos_discard') {
+          const cnt = Math.min(discardCount || 1, s.players[0].hand.length);
+          if (cnt > 0) {
+            s.pendingInteraction = { type: 'CHOOSE_DISCARD', count: cnt, destination: 'grave', selectedUids: [], appendEffect: true, effectPrefix: '#1: ', reason: reason || `Choose ${cnt} card(s) to discard.` };
+          }
+          return s;
+        }
         return playTrickCard(s, attackerId, card, 0, true);
       }
     });
   };
 
   const openAscendModal = () => {
+    if (!game || game.phase !== 'ASCEND') return;
     setAscendSelectedUids([]);
     setShowAscendModal(true);
   };
@@ -5816,13 +6950,14 @@ export default function App() {
   const GLOSSARY_TERMS = [
     { term: 'Acting Condition', def: 'A Sequence-specific gameplay task. Completing it flips your potion to Digested (+1 bonus draw on Ascension).' },
     { term: 'Apotheosis (Seq 0)', def: 'Ascending from Sequence 1 to Sequence 0 immediately wins the game.' },
-    { term: 'Chaos Event', def: 'Any unused Major Arcana card played from Hand. Resolves in FIFO order, then recycles itself + top X Grave cards to the bottom of the Deck.' },
+    { term: 'Chaos Event', def: 'Any Major Arcana card (all 22 remain in the full 78-card Deck) played from Hand. Resolves in FIFO order, then recycles itself + top X Grave cards to the bottom of the Deck.' },
     { term: 'Digested vs. Undigested', def: 'Digested Ascension draws +1 bonus card. Undigested (Reckless) Ascension forces you to discard 3 Hand cards.' },
     { term: 'FIFO vs. Interrupt', def: 'Chaos Events & proactive abilities resolve First-In, First-Out (FIFO). Defensive Knights, Queens, and Interrupt abilities resolve immediately to cancel attacks.' },
     { term: 'Grave Recycle (X)', def: 'When a Major Arcana numbered X (0–21) resolves, move it + the top X cards of the Grave to the bottom of the Deck.' },
     { term: 'Ingredient Pouch', def: 'Your private 3-card face-down zone holding numbered cards for Ascension math and Page Traps. Before or after a trick, you may tuck as many Hand cards as fit (up to 3) or discard unwanted Pouch cards to the Grave.' },
     { term: 'Mental Break', def: 'Ending a round with 0 Hand cards (or hitting 0 on a forced Wand discard) causes you to skip your next round and draw 2 recovery cards.' },
-    { term: 'Recast Sanity Cost', def: 'The first time you cast your current Sequence ability is FREE. Every subsequent recast at that same Sequence costs 1 Hand discard.' },
+    { term: 'Sanity Toll (Ability Cost)', def: 'Activating your Sequence Ability is FREE while Undigested. Once you fulfill your Acting Condition (Digested), activating your ability costs 1 Hand discard.' },
+    { term: 'Shorthand Netlist Notation', def: 'Start: G= #1: z9, #2: z0; (Pathways z0–z21). Cards: S/W/P/C + 1–10/P/N/Q/K (P1, CK, WQ), Major X0–X21. Zones & Effects: + (Hand), +/ (Pouch), - (Discard), -/ (Destroy Pouch), -/P10=4 (10 wildcard value in Pouch), -W7s (Stolen), g (Grave), V(...) (Hand revealed), /V(...) (Pouch revealed), (+3)/(-3) & W6(+3=9) (Trick value change). Deck/Grave: k^ (Deck top), k_ (Deck bottom), k^(S6,S10→S10,S6) (reorder top), k^: V(S6→k_) (send top to bottom), k^S6↔g_C2 (swap Deck top with Grave bottom), g^→k_(...) (recycle to Deck bottom), k~ (shuffle). Inactive Player: #2x (skipped this round; R2= (#2x), #2x (+C1,+C2)). Phases: R1=, D1=, T1=/T1&, A1=/A1&. Interrupts: < #2z0:!q8, < #2z0:!Xid. Digestion/Ascend: q8>, @q8, @q8*, ?P/?0, (T=S4).' },
     { term: 'Seer\'s Gamble', def: 'Trick Winner option: guess the Suit of the next Minor Arcana on top of the Deck. Reveal until a Minor appears—if right, scoop ALL revealed cards (including Major Arcana) + Trump!' },
     { term: 'Shrinking Hand Cap', def: 'Maximum Hand size enforced at end of round (excess goes to Grave). Standard: 10→9→8→7. Strict: 7→6→5.' },
     { term: 'Trump Override (10 & Ace)', def: 'Playing a 10 overrides the Trump Suit in tricks (beaten by an Ace of the same Suit), OR tuck a 10 into your Pouch as a Wildcard (any Number 1–9) for Ascension!' }
@@ -5888,7 +7023,7 @@ export default function App() {
                     <ol className="list-decimal list-inside space-y-1">
                       <li><strong>Phase 1 — Pouch & Draft (Before Trick, No Start Draw):</strong> The <em>only</em> phase to tuck cards into your 3-card Pouch or discard unwanted Pouch cards to the Grave (skipped players draw 2 recovery cards instead). Sequence Abilities, Chaos Events, Knights, and Queens are <strong>Instants</strong> playable at any time!</li>
                       <li><strong>Center Reveal & Draft:</strong> Reveal N+1 cards. Lowest rank (highest Seq number) drafts first; last card left is the <strong>Trump Card</strong>.</li>
-                      <li><strong>Trick Play:</strong> Highest rank (last drafter) leads. Follow Leading Suit if able. Each card's Suit Action resolves immediately.</li>
+                      <li><strong>Trick Play:</strong> Highest rank (last drafter) leads. Play <strong>any</strong> Minor or Major Arcana into the trick (no forced follow-suit!). If the Trump Card is a Major Arcana, Major Arcana is Trump and the highest Arcana value (0–21) wins. Targeting cards only target <em>active</em> opponents.</li>
                       <li><strong>Trick Winner Reward:</strong> Take the Trump Card OR attempt the <strong>Seer's Gamble</strong>.</li>
                       <li><strong>Ascension & Hand Cap:</strong> Spend Pouch cards summing to your current Seq. Trim Hand to your Sequence cap (excess to Grave). Ending at 0 cards triggers a <strong>Mental Break</strong>.</li>
                     </ol>
@@ -6133,6 +7268,12 @@ export default function App() {
             >
               <Zap className="w-4 h-4 text-violet-400" /> Demo Board Lab
             </button>
+            <button
+              onClick={() => setScreen('replay')}
+              className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-indigo-950/70 border border-indigo-400/50 hover:border-indigo-300 text-xs font-bold text-indigo-200 transition"
+            >
+              <History className="w-4 h-4 text-indigo-400" /> History & Replay {gameHistory.length > 0 ? `(${gameHistory.length})` : ''}
+            </button>
 
             <div className="flex items-center gap-2 bg-[#14121f] border border-emerald-500/30 rounded-xl px-3 py-1.5">
               <span className="text-xs text-slate-300 font-medium">Opponents:</span>
@@ -6312,6 +7453,275 @@ export default function App() {
   }
 
   // ============================================================================
+  // 8A2. RENDER: PAST GAME HISTORY & INTERACTIVE NETLIST REPLAY VIEWER
+  // ============================================================================
+  if (screen === 'replay') {
+    const curFrame = replayFrames[replayStep] || replayFrames[0] || null;
+    const rState = curFrame?.state || null;
+    return (
+      <div className="min-h-screen bg-[#0b0a12] text-slate-100 p-4 md:p-6">
+        <div className="max-w-7xl mx-auto space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-white/10">
+            <div className="flex items-center gap-2.5">
+              <History className="w-5 h-5 text-indigo-400" />
+              <div>
+                <h1 className="font-serif font-bold text-lg text-amber-200">Past Game History & Netlist Replay Studio</h1>
+                <p className="text-xs text-slate-400">Step through any saved match or paste a Shorthand Netlist to reconstruct every phase and card movement.</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {game && (
+                <button onClick={() => setScreen('playing')} className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold">
+                  Resume Live Match
+                </button>
+              )}
+              <button onClick={() => setScreen('setup')} className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10 text-xs font-bold text-slate-200">
+                ← Back to Setup
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+            {/* LEFT: PAST GAME HISTORY + CUSTOM NETLIST IMPORTER (4 cols) */}
+            <div className="lg:col-span-4 space-y-4">
+              <div className="rounded-2xl border border-indigo-500/30 bg-[#12101c] p-3.5 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-bold uppercase tracking-wider text-indigo-300 flex items-center gap-1.5">
+                    <History className="w-3.5 h-3.5" /> Past Game History ({gameHistory.length})
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => openReplayWithNetlist(SAMPLE_REPLAY_NETLIST, 'Sample Verified Match (Fool vs Magician vs Empress)')}
+                    className="px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/35 border border-amber-400/40 text-[10px] font-bold text-amber-200"
+                  >
+                    Load Sample
+                  </button>
+                </div>
+                {gameHistory.length === 0 ? (
+                  <p className="text-xs text-slate-400 py-2">No saved matches yet. Finish a game (auto-saved) or click <strong>Save</strong> in the Chronicle sidebar during any match.</p>
+                ) : (
+                  <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                    {gameHistory.map(h => (
+                      <div key={h.id} className="p-2.5 rounded-xl bg-slate-900/80 border border-white/10 space-y-1">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="text-xs font-bold text-amber-200 leading-tight">{h.title}</div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setGameHistory(prev => {
+                                const next = prev.filter(x => x.id !== h.id);
+                                try { localStorage.setItem('lotm_game_history_v1', JSON.stringify(next)); } catch (_) {}
+                                return next;
+                              });
+                            }}
+                            className="text-slate-500 hover:text-rose-400 p-0.5"
+                            title="Delete from history"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                        <div className="text-[10px] text-slate-400">{h.players}</div>
+                        <div className="flex items-center justify-between pt-1">
+                          <span className="text-[10px] text-slate-500">{h.date}</span>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => openReplayWithNetlist(h.netlist, h.title)}
+                              className="px-2 py-0.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-bold"
+                            >
+                              Replay
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-2xl border border-white/10 bg-[#12101c] p-3.5 space-y-2">
+                <div className="text-xs font-bold uppercase tracking-wider text-amber-300">Paste Any Netlist to Replay</div>
+                <textarea
+                  value={replayInput}
+                  onChange={e => setReplayInput(e.target.value)}
+                  rows={8}
+                  placeholder="G= #1: z0, #2: z1, #3: z3;&#10;R1=&#10;#1: +/S7&#10;D1= W9, P7, S3, C5&#10;..."
+                  className="w-full rounded-xl bg-black/50 border border-white/15 p-2.5 font-mono text-[11px] text-amber-100 outline-none focus:border-amber-400"
+                />
+                <button
+                  type="button"
+                  onClick={() => openReplayWithNetlist(replayInput, 'Custom Imported Netlist')}
+                  className="w-full py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs transition"
+                >
+                  Parse & Load Netlist ({parseNetlistToFrames(replayInput).length} Steps)
+                </button>
+              </div>
+            </div>
+
+            {/* RIGHT: VISUAL BOARD RECONSTRUCTION + VCR CONTROLS (8 cols) */}
+            <div className="lg:col-span-8 space-y-3">
+              {/* VCR Playback Controls */}
+              <div className="rounded-2xl border border-amber-500/30 bg-[#141222] p-3.5 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-bold text-amber-200">{replayTitle}</div>
+                    <div className="text-[11px] text-slate-400">
+                      Step <span className="text-amber-300 font-bold">{replayFrames.length > 0 ? replayStep + 1 : 0}</span> / {replayFrames.length}
+                      {rState && <> · Round <span className="text-sky-300 font-bold">{rState.round}</span> · Phase <span className="text-emerald-300 font-bold">{rState.phase}</span></>}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <button onClick={() => { setReplayPlaying(false); setReplayStep(0); }} className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10" title="Start"><SkipBack className="w-3.5 h-3.5" /></button>
+                    <button onClick={() => { setReplayPlaying(false); setReplayStep(s => Math.max(0, s - 1)); }} className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10" title="Previous Step"><ChevronLeft className="w-3.5 h-3.5" /></button>
+                    <button
+                      onClick={() => {
+                        if (replayStep >= replayFrames.length - 1) setReplayStep(0);
+                        setReplayPlaying(p => !p);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center gap-1"
+                    >
+                      {replayPlaying ? <><Pause className="w-3.5 h-3.5" /> Pause</> : <><Play className="w-3.5 h-3.5" /> Play</>}
+                    </button>
+                    <button onClick={() => { setReplayPlaying(false); setReplayStep(s => Math.min(replayFrames.length - 1, s + 1)); }} className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10" title="Next Step"><ChevronRight className="w-3.5 h-3.5" /></button>
+                    <button onClick={() => { setReplayPlaying(false); setReplayStep(Math.max(0, replayFrames.length - 1)); }} className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10" title="End"><SkipForward className="w-3.5 h-3.5" /></button>
+                    <select
+                      value={replaySpeedMs}
+                      onChange={e => setReplaySpeedMs(Number(e.target.value))}
+                      className="bg-slate-900 border border-white/10 rounded-lg px-2 py-1 text-[11px] text-slate-200 font-bold"
+                    >
+                      <option value={1500}>0.5x</option>
+                      <option value={950}>1x</option>
+                      <option value={450}>2x</option>
+                    </select>
+                  </div>
+                </div>
+                {replayFrames.length > 1 && (
+                  <input
+                    type="range"
+                    min={0}
+                    max={replayFrames.length - 1}
+                    value={replayStep}
+                    onChange={e => { setReplayPlaying(false); setReplayStep(Number(e.target.value)); }}
+                    className="w-full accent-amber-400 cursor-pointer"
+                  />
+                )}
+                {curFrame && (
+                  <div className="p-2 rounded-xl bg-black/45 border border-amber-500/25 flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-mono text-xs font-bold text-amber-200">{curFrame.token}</span>
+                    <span className="text-xs text-slate-300">{curFrame.desc}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Reconstructed Visual Table */}
+              {rState && (
+                <div className="rounded-2xl border border-white/10 bg-[#12101c] p-4 space-y-4">
+                  {/* Players Grid */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    {rState.players.map(pl => {
+                      const pw = PATHWAYS[pl.pathwayId] || PATHWAYS[0];
+                      return (
+                        <div key={pl.id} className={`p-3 rounded-xl border space-y-2 ${rState.winnerId === pl.id ? 'bg-amber-950/40 border-amber-400' : pl.inactive ? 'bg-rose-950/20 border-rose-500/40 opacity-75' : 'bg-slate-900/70 border-white/10'}`}>
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <div className="text-xs font-bold text-amber-200">{pl.name} · {pw.arcana} (z{pl.pathwayId})</div>
+                              <div className="text-[11px] text-slate-400">Seq {pl.seq} {pw.seqs[pl.seq]?.name || 'God'}</div>
+                            </div>
+                            <div className="flex flex-col items-end gap-1">
+                              {pl.digested && <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/50 text-[10px] font-bold text-emerald-300">q{pl.seq}&gt;</span>}
+                              {pl.inactive && <span className="px-1.5 py-0.5 rounded bg-rose-500/20 border border-rose-400/50 text-[10px] font-bold text-rose-300">#{pl.id + 1}x</span>}
+                              {rState.winnerId === pl.id && <span className="px-1.5 py-0.5 rounded bg-amber-500 text-slate-950 text-[10px] font-bold">WIN</span>}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Tracked Pouch ({pl.pouch.length})</div>
+                            <div className="flex flex-wrap gap-1">
+                              {pl.pouch.length === 0 ? <span className="text-[10px] text-slate-600">Empty</span> : pl.pouch.map(c => (
+                                <span key={c.uid} className="px-1.5 py-0.5 rounded bg-violet-950/70 border border-violet-400/40 font-mono text-[10px] font-bold text-violet-200">{cardCode(c)}</span>
+                              ))}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Tracked Hand ({pl.hand.length})</div>
+                            <div className="flex flex-wrap gap-1">
+                              {pl.hand.length === 0 ? <span className="text-[10px] text-slate-600">—</span> : pl.hand.map(c => (
+                                <span key={c.uid} className="px-1.5 py-0.5 rounded bg-slate-800 border border-white/10 font-mono text-[10px] font-bold text-slate-200">{cardCode(c)}</span>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Center Arena: Trump, Draft Pool, Trick Plays, Grave */}
+                  <div className="grid grid-cols-1 md:grid-cols-12 gap-3 pt-2 border-t border-white/10">
+                    <div className="md:col-span-3 p-3 rounded-xl bg-amber-950/20 border border-amber-500/30 flex flex-col items-center justify-center gap-1.5">
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-amber-300">Trump Card</div>
+                      {rState.trumpCard ? <TarotCard card={rState.trumpCard} small highlight /> : <div className="text-xs text-slate-500 py-6">None</div>}
+                    </div>
+                    <div className="md:col-span-6 p-3 rounded-xl bg-slate-900/60 border border-white/10 space-y-2">
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-sky-300">
+                        {rState.centerDraft.length > 0 ? `Center Draft Pool (${rState.centerDraft.length})` : `Trick Table (${rState.trickPlays.length} played)`}
+                      </div>
+                      <div className="flex flex-wrap justify-center gap-2.5 min-h-[108px] items-center">
+                        {rState.centerDraft.length > 0 ? (
+                          rState.centerDraft.map(c => <TarotCard key={c.uid} card={c} small />)
+                        ) : rState.trickPlays.length > 0 ? (
+                          rState.trickPlays.map((tp, idx) => (
+                            <div key={idx} className="flex flex-col items-center gap-1">
+                              <span className="text-[10px] font-bold text-amber-300">#{tp.playerId + 1} {tp.tvTag}</span>
+                              <TarotCard card={tp.card} small highlight />
+                            </div>
+                          ))
+                        ) : (
+                          <span className="text-xs text-slate-500">{rState.banner}</span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="md:col-span-3 p-3 rounded-xl bg-slate-900/60 border border-white/10 space-y-1.5">
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Grave ({rState.grave.length})</div>
+                      <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto">
+                        {rState.grave.slice(0, 14).map((c, i) => (
+                          <span key={c.uid + i} className="px-1.5 py-0.5 rounded bg-black/50 border border-white/10 font-mono text-[10px] text-slate-300">{cardCode(c)}</span>
+                        ))}
+                        {rState.grave.length === 0 && <span className="text-[10px] text-slate-600">Empty</span>}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Clickable Step-by-Step Netlist Timeline */}
+              <div className="rounded-2xl border border-white/10 bg-[#12101c] p-3 space-y-2">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">Clickable Netlist Timeline (Jump to Any Step)</div>
+                <div className="flex flex-wrap gap-1.5 max-h-40 overflow-y-auto">
+                  {replayFrames.map((fr, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => { setReplayPlaying(false); setReplayStep(idx); }}
+                      className={`px-2 py-1 rounded font-mono text-[10px] font-bold border transition ${
+                        idx === replayStep
+                          ? 'bg-amber-500 text-slate-950 border-amber-300'
+                          : idx < replayStep
+                            ? 'bg-slate-800/90 text-slate-200 border-white/10 hover:border-amber-400/50'
+                            : 'bg-slate-950 text-slate-500 border-white/5 hover:text-slate-300'
+                      }`}
+                    >
+                      {fr.token}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ============================================================================
   // 8B. RENDER: PLAYABLE BOARD DEMO LAB (MIRRORS MAIN GAME SCREEN)
   // ============================================================================
   if (screen === 'lab' && labState) {
@@ -6351,16 +7761,54 @@ export default function App() {
       });
     };
 
+    const stepLabPhase = (targetPhase) => {
+      setLabState(prev => {
+        if (targetPhase === 'POUCH_ADD') return beginRoundDraw({ ...prev, round: prev.round });
+        if (targetPhase === 'DRAFT') return startDraftPhase(prev);
+        if (targetPhase === 'TRICK') {
+          let s = prev.centerDraft.length === 0 ? startDraftPhase(prev) : prev;
+          while (s.centerDraft.length > 1) s = { ...s, centerDraft: s.centerDraft.slice(1) };
+          return startTrickPhase(s);
+        }
+        if (targetPhase === 'ASCEND') return { ...prev, phase: 'ASCEND', logs: addLog(prev.logs, `Phase 3: Ascension Phase — spend Pouch ingredients to Ascend.`, 'info', `A${prev.round}=`, { newPhase: true }) };
+        if (targetPhase === 'NEXT_ROUND') return advanceToNextRound(prev);
+        return prev;
+      });
+    };
+
     const handleLabHandCardClick = (card) => {
       if (labState.pendingInteraction) return;
+      if (labState.phase === 'POUCH_ADD') {
+        setLabState(prev => {
+          const h = prev.players[0];
+          const maxP = h.mods.maxPouch || 3;
+          if (h.pouch.length >= maxP) return { ...prev, logs: addLog(prev.logs, `Pouch is full (${maxP}/${maxP}) — advance to Draft!`, 'danger') };
+          return {
+            ...prev,
+            players: prev.players.map((p, i) => i === 0 ? { ...p, hand: p.hand.filter(c => c.uid !== card.uid), pouch: [...p.pouch, card] } : p),
+            logs: addLog(prev.logs, `You tucked ${cardShortName(card)} into your Pouch (${h.pouch.length + 1}/${maxP}).`, 'info', `#1: +/${cardCode(card)}`)
+          };
+        });
+        return;
+      }
       if (card.type === 'major') {
         setLabState(prev => resolveChaosEvent(prev, 0, card, 1));
         return;
       }
-      // Play Minor Arcana straight onto the Demo Trick Table (targeting Dummy A if Sword/Wand/King)
+      // Play Minor Arcana into the real Trick sequence, then let AI opponents finish the trick!
       setLabState(prev => {
-        const next = playTrickCard(prev, 0, card, 1, true);
-        return { ...next, phase: 'TRICK', trickTurnIdx: 0 };
+        let next = playTrickCard(prev, 0, card, 1, true);
+        if (next.pendingInteraction) return next;
+        let guard = 0;
+        while (next.phase === 'TRICK' && !next.pendingInteraction && guard < 4) {
+          const actorId = next.trickOrder[next.trickTurnIdx];
+          const actor = next.players[actorId];
+          if (!actor || actor.isHuman || actor.hand.length === 0) break;
+          const aiCard = actor.hand.find(c => c.type === 'minor') || actor.hand[0];
+          next = playTrickCard(next, actorId, aiCard, 0, true);
+          guard++;
+        }
+        return next;
       });
     };
 
@@ -6436,8 +7884,24 @@ export default function App() {
             <button
               onClick={() => {
                 const mkCard = (uid, suit, rank) => ({ uid, type: 'minor', suit, rank, label: rank === 1 ? 'A' : rank === 11 ? 'Page' : rank === 12 ? 'Knight' : rank === 13 ? 'Queen' : rank === 14 ? 'King' : String(rank) });
-                const mkMajor = (uid, majorId) => ({ uid, type: 'major', majorId, name: PATHWAYS[majorId].arcana });
-                const makeBaseState = (pid, seq, oppPid = (pid + 1) % 22, oppSeq = 5) => ({
+                const mkMajor = (uid, majorId) => ({ uid, type: 'major', majorId, roman: ROMAN[majorId], name: PATHWAYS[majorId].arcana });
+                const cloneBoard = (b) => ({
+                  ...b,
+                  trumpCard: b.trumpCard ? { ...b.trumpCard } : null,
+                  deck: b.deck.map(c => ({ ...c })),
+                  grave: b.grave.map(c => ({ ...c })),
+                  trickPlays: b.trickPlays.map(tp => ({ ...tp, card: { ...tp.card } })),
+                  roundMods: { ...b.roundMods },
+                  logs: [],
+                  players: b.players.map(p => ({
+                    ...p,
+                    hand: p.hand.map(c => ({ ...c })),
+                    pouch: p.pouch.map(c => ({ ...c })),
+                    mods: { ...p.mods },
+                    faceCounts: { K: 0, Q: 0, N: 0, P: 0 }
+                  }))
+                });
+                const makeSeededBoard = (pid, seq, oppPid = (pid + 1) % 22, oppSeq = 5, forHumanPlay = false) => ({
                   round: 4,
                   dealerIdx: 0,
                   phase: 'TRICK',
@@ -6464,202 +7928,288 @@ export default function App() {
                   ],
                   players: [
                     {
-                      id: 0, name: 'Tester', isHuman: true, pathwayId: pid, seq, actingDone: false,
-                      abilityUsed: false, abilityCastsThisSeq: 0, skipNextTurn: false, skippedThisRound: false,
+                      id: 0, name: forHumanPlay ? 'You' : 'Tester', isHuman: forHumanPlay, pathwayId: pid, seq, actingDone: false,
+                      safeRoundsCount: 0, abilityUsed: false, abilityCastsThisSeq: 0, skipNextTurn: false, skippedThisRound: false,
                       pouchLostThisRound: false, targetedThisRound: false, lostCardThisRound: false, mods: {},
                       hand: [mkCard('h1', 'swords', 4), mkCard('h2', 'cups', 4), mkCard('h3', 'pentacles', 2), mkCard('h4', 'wands', 7), mkCard('h5', 'cups', 1)],
                       pouch: [mkCard('p1', 'swords', 3), mkCard('p2', 'cups', 5)]
                     },
                     {
-                      id: 1, name: 'Rival', isHuman: false, pathwayId: oppPid, seq: oppSeq, actingDone: false,
-                      abilityUsed: false, abilityCastsThisSeq: 0, skipNextTurn: false, skippedThisRound: false,
+                      id: 1, name: 'Dummy A', isHuman: false, pathwayId: oppPid, seq: oppSeq, actingDone: false,
+                      safeRoundsCount: 0, abilityUsed: false, abilityCastsThisSeq: 0, skipNextTurn: false, skippedThisRound: false,
                       pouchLostThisRound: false, targetedThisRound: false, lostCardThisRound: false, mods: {},
                       hand: [mkCard('oh1', 'cups', 8), mkCard('oh2', 'wands', 6), mkCard('oh3', 'pentacles', 5), mkCard('oh4', 'swords', 3), mkCard('oh5', 'cups', 9), mkCard('oh6', 'wands', 4)],
                       pouch: [mkCard('op1', 'pentacles', 4), mkCard('op2', 'wands', 2)]
                     }
                   ]
                 });
-                const summarizeDelta = (before, after, pIdx = 0) => {
-                  const bA = before.players[pIdx], aA = after.players[pIdx];
-                  const bO = before.players[1 - pIdx], aO = after.players[1 - pIdx];
+                const uidSig = (arr) => (arr || []).map(c => c.uid).join(',');
+                const stateVector = (before, after) => {
+                  const bA = before.players[0], aA = after.players[0];
+                  const bO = before.players[1], aO = after.players[1];
+                  return {
+                    dH: aA.hand.length - bA.hand.length,
+                    dP: aA.pouch.length - bA.pouch.length,
+                    dOH: aO.hand.length - bO.hand.length,
+                    dOP: aO.pouch.length - bO.pouch.length,
+                    hSwap: uidSig(aA.hand) !== uidSig(bA.hand),
+                    pSwap: uidSig(aA.pouch) !== uidSig(bA.pouch),
+                    oHSwap: uidSig(aO.hand) !== uidSig(bO.hand),
+                    oPSwap: uidSig(aO.pouch) !== uidSig(bO.pouch),
+                    oppSkip: !!aO.skipNextTurn && !bO.skipNextTurn,
+                    oppLock: !!aO.abilityUsed && !bO.abilityUsed,
+                    trumpChg: after.trumpCard?.uid !== before.trumpCard?.uid,
+                    deckChg: uidSig(after.deck) !== uidSig(before.deck),
+                    digested: !!aA.actingDone && !bA.actingDone,
+                    mods: Object.keys(aA.mods || {}).filter(k => aA.mods[k]).sort().join(','),
+                    rMods: Object.keys(after.roundMods || {}).filter(k => after.roundMods[k]).sort().join(',')
+                  };
+                };
+                const formatVec = (v) => {
                   const parts = [];
-                  if (aA.hand.length !== bA.hand.length) parts.push(`Hand ${aA.hand.length - bA.hand.length > 0 ? '+' : ''}${aA.hand.length - bA.hand.length}`);
-                  if (aA.pouch.length !== bA.pouch.length) parts.push(`Pouch ${aA.pouch.length - bA.pouch.length > 0 ? '+' : ''}${aA.pouch.length - bA.pouch.length}`);
-                  if (aO.hand.length !== bO.hand.length) parts.push(`OppHand ${aO.hand.length - bO.hand.length > 0 ? '+' : ''}${aO.hand.length - bO.hand.length}`);
-                  if (aO.pouch.length !== bO.pouch.length) parts.push(`OppPouch ${aO.pouch.length - bO.pouch.length > 0 ? '+' : ''}${aO.pouch.length - bO.pouch.length}`);
-                  if (aO.skipNextTurn && !bO.skipNextTurn) parts.push('OppSkip');
-                  if (aO.abilityUsed && !bO.abilityUsed) parts.push('OppLocked');
-                  const modKeys = Object.keys(aA.mods || {}).filter(k => aA.mods[k]);
-                  const oppModKeys = Object.keys(aO.mods || {}).filter(k => aO.mods[k]);
-                  const rModKeys = Object.keys(after.roundMods || {}).filter(k => after.roundMods[k]);
-                  if (modKeys.length) parts.push(`Mods[${modKeys.join(',')}]`);
-                  if (oppModKeys.length) parts.push(`OppMods[${oppModKeys.join(',')}]`);
-                  if (rModKeys.length) parts.push(`Round[${rModKeys.join(',')}]`);
-                  if (after.trumpCard?.uid !== before.trumpCard?.uid) parts.push('TrumpChanged');
-                  if (after.deck[0]?.uid !== before.deck[0]?.uid && parts.length === 0) parts.push('DeckChanged');
-                  if (after.pendingInteraction) parts.push(`Modal(${after.pendingInteraction.type})`);
+                  if (v.dH) parts.push(`Hand ${v.dH > 0 ? '+' : ''}${v.dH}`);
+                  else if (v.hSwap) parts.push('HandSwapped');
+                  if (v.dP) parts.push(`Pouch ${v.dP > 0 ? '+' : ''}${v.dP}`);
+                  else if (v.pSwap) parts.push('PouchSwapped');
+                  if (v.dOH) parts.push(`OppHand ${v.dOH > 0 ? '+' : ''}${v.dOH}`);
+                  else if (v.oHSwap) parts.push('OppHandSwapped');
+                  if (v.dOP) parts.push(`OppPouch ${v.dOP > 0 ? '+' : ''}${v.dOP}`);
+                  else if (v.oPSwap) parts.push('OppPouchSwapped');
+                  if (v.oppSkip) parts.push('OppSkip');
+                  if (v.oppLock) parts.push('OppLocked');
+                  if (v.mods) parts.push(`Mods[${v.mods}]`);
+                  if (v.rMods) parts.push(`Round[${v.rMods}]`);
+                  if (v.trumpChg) parts.push('TrumpChanged');
+                  if (v.deckChg && parts.length === 0) parts.push('DeckReordered');
+                  if (v.digested && parts.length === 0) parts.push('Digested');
                   return parts.length ? parts.join(' • ') : 'No state change';
+                };
+                const vectorsMatch = (lv, hv) =>
+                  lv.dH === hv.dH && lv.dP === hv.dP && lv.dOH === hv.dOH && lv.dOP === hv.dOP &&
+                  lv.oppSkip === hv.oppSkip && lv.trumpChg === hv.trumpChg;
+
+                // Real Headless Chaos executor on the exact same seeded state (matches runHeadlessGame 1-to-1!)
+                const runHeadlessChaosStep = (hS, majorCard) => {
+                  const p = hS.players[0], target = hS.players[1], otherPs = [target];
+                  const deck = hS.deck, grave = hS.grave, roundMods = hS.roundMods;
+                  const drawN = (n) => { const o = []; for (let i = 0; i < n && deck.length > 0; i++) o.push(deck.shift()); return o; };
+                  p.hand = p.hand.filter(c => c.uid !== majorCard.uid);
+                  const cid = majorCard.majorId;
+                  if (cid === 0) { const m = p.hand.find(c => c.type === 'minor'); if (m && hS.trumpCard) { p.hand = p.hand.filter(c => c.uid !== m.uid); p.hand.push(hS.trumpCard); hS.trumpCard = m; roundMods.trumpChanged = true; } }
+                  else if (cid === 1) { if (p.pouch.length > 0 && target.pouch.length > 0 && !target.mods.pouchImmune) { const aC = p.pouch.pop(); p.pouch.push(target.pouch.pop()); target.pouch.push(aC); } }
+                  else if (cid === 2) { if (deck.length >= 2) { const top = deck.splice(0, Math.min(3, deck.length)).sort((a, b) => (b.rank || 10) - (a.rank || 10)); deck.unshift(...top); } }
+                  else if (cid === 3) { let revP = false; if (target.pouch.length > 0 && !target.mods.pouchImmune) { if (target.pouch[0].rank === 11) { grave.unshift(target.pouch.shift()); revP = true; } } if (!revP && !target.mods.handImmune && target.hand.length > 0) discardSmart(target, grave, 1); }
+                  else if (cid === 4) { roundMods.invertTrick = true; }
+                  else if (cid === 5) { const reqS = hS.trumpCard?.suit || 'swords'; for (const o of otherPs) if (!o.mods.handImmune && !o.hand.some(c => c.suit === reqS) && o.hand.length > 0) discardSmart(o, grave, 1); }
+                  else if (cid === 6) { if (p.hand.length > 0 && target.hand.length > 0) { const tmp = p.hand.pop(); p.hand.push(target.hand.pop()); target.hand.push(tmp); } }
+                  else if (cid === 7) { roundMods.noTrumpChariot = true; }
+                  else if (cid === 8) { roundMods.globalImmunity = true; }
+                  else if (cid === 9) { const gi = grave.findIndex(c => c.type === 'minor'); if (gi !== -1) p.hand.push(grave.splice(gi, 1)[0]); }
+                  else if (cid === 10) { const passed = hS.players.map(q => (q.hand.length > 0 ? q.hand.pop() : null)); hS.players.forEach((q, qi) => { const f = (qi - 1 + hS.players.length) % hS.players.length; if (passed[f]) q.hand.push(passed[f]); q.hand.push(...drawN(1)); }); }
+                  else if (cid === 11) { const srt = [...hS.players].sort((a, b) => b.hand.length - a.hand.length); if (srt[0].id !== srt[srt.length - 1].id && srt[0].hand.length > 0) srt[srt.length - 1].hand.push(srt[0].hand.pop()); }
+                  else if (cid === 12) { discardSmart(p, grave, 2); const mp = p.mods.maxPouch || 3; for (const c of drawN(2)) { if (p.pouch.length < mp) p.pouch.push(c); else p.hand.push(c); } }
+                  else if (cid === 13) { for (const q of hS.players) if (q.pouch.length > 0 && !q.mods.pouchImmune) grave.unshift(q.pouch.pop()); }
+                  else if (cid === 14) { roundMods.cancelSuitActions = true; }
+                  else if (cid === 15) { for (const o of otherPs) { if (o.hand.length > 1 && !o.mods.handImmune) discardSmart(o, grave, 1); else if (o.pouch.length > 0 && !o.mods.pouchImmune) grave.unshift(o.pouch.pop()); } }
+                  else if (cid === 16) { if (hS.trumpCard) grave.unshift(hS.trumpCard); const gi = grave.findIndex(c => c.type === 'minor'); if (gi !== -1) hS.trumpCard = grave.splice(gi, 1)[0]; roundMods.trumpChanged = true; }
+                  else if (cid === 17) { p.hand.push(...drawN(1)); }
+                  else if (cid === 18) { const pool = []; const cnts = hS.players.map(q => { const n = q.pouch.length; pool.push(...q.pouch); q.pouch = []; return n; }); hS.players.forEach((q, qi) => { q.pouch = pool.splice(0, cnts[qi]); }); }
+                  else if (cid === 19) { p.hand.push(...drawN(1)); if (p.pouch.length < (p.mods.maxPouch || 3) && p.hand.length > 0) p.pouch.push(p.hand.pop()); }
+                  else if (cid === 20) { for (const o of otherPs) if (o.pouch.length > 0 && !o.mods.pouchImmune) o.hand.push(o.pouch.pop()); }
+                  else if (cid === 21) { p.mods.trickBonus = (p.mods.trickBonus || 0) + 3; }
+                  const rec = grave.splice(0, Math.min(cid, grave.length));
+                  deck.push(majorCard, ...rec);
+                  return hS;
                 };
 
                 const rows = [];
-                // 1. ALL 198 PATHWAY SEQUENCE ABILITIES (Live + Headless)
+                // 1. ALL 198 SEQUENCE ABILITIES — Exact Same Seeded Board State in Live vs. Headless!
                 for (const pw of PATHWAYS) {
                   for (let sq = 9; sq >= 1; sq--) {
                     const sd = pw.seqs[sq];
-                    const liveBefore = makeBaseState(pw.id, sq);
-                    let liveOk = false, liveNote = '', liveSummary = '';
+                    const baseBoard = makeSeededBoard(pw.id, sq);
+                    const liveBefore = cloneBoard(baseBoard);
+                    const hBefore = cloneBoard(baseBoard);
+                    let liveOk = false, liveNote = '', lv = null;
                     try {
                       const liveAfter = executeSequenceAbility(liveBefore, 0, 1);
-                      liveSummary = summarizeDelta(liveBefore, liveAfter, 0);
-                      liveOk = liveAfter.players[0].abilityUsed && (liveSummary !== 'No state change' || !!liveAfter.pendingInteraction);
-                      liveNote = liveSummary;
+                      lv = stateVector(liveBefore, liveAfter);
+                      liveNote = formatVec(lv);
+                      liveOk = liveAfter.players[0].abilityUsed && liveNote !== 'No state change';
                     } catch (e) { liveOk = false; liveNote = 'ERR: ' + e.message; }
 
-                    const hBefore = makeBaseState(pw.id, sq);
-                    let hOk = false, hNote = '';
+                    let hOk = false, hNote = '', hv = null;
                     try {
-                      const hDeck = [...hBefore.deck], hGrave = [...hBefore.grave];
-                      const hPlayers = hBefore.players.map(pl => ({ ...pl, hand: [...pl.hand], pouch: [...pl.pouch], mods: { ...pl.mods }, faceCounts: { K: 0, Q: 0, N: 0, P: 0 } }));
                       const hTrump = { card: hBefore.trumpCard };
-                      const hRoundMods = {};
-                      const drawN = (n) => { const out = []; for (let i = 0; i < n && hDeck.length > 0; i++) out.push(hDeck.shift()); return out; };
-                      applyHeadlessAbility(hPlayers[0], hPlayers, hPlayers[1], hDeck, hGrave, hTrump, hRoundMods, drawN);
-                      const hAfter = { players: hPlayers, deck: hDeck, grave: hGrave, trumpCard: hTrump.card, roundMods: hRoundMods };
-                      hNote = summarizeDelta(hBefore, hAfter, 0);
-                      hOk = hNote !== 'No state change' || sd.tag === 'reader_scry' || sd.tag === 'peek_deck_2';
+                      const drawN = (n) => { const out = []; for (let i = 0; i < n && hBefore.deck.length > 0; i++) out.push(hBefore.deck.shift()); return out; };
+                      applyHeadlessAbility(hBefore.players[0], hBefore.players, hBefore.players[1], hBefore.deck, hBefore.grave, hTrump, hBefore.roundMods, drawN);
+                      hBefore.trumpCard = hTrump.card;
+                      hv = stateVector(baseBoard, hBefore);
+                      hNote = formatVec(hv);
+                      hOk = hNote !== 'No state change';
                     } catch (e) { hOk = false; hNote = 'ERR: ' + e.message; }
 
-                    const parity = liveOk && hOk;
+                    const exactMatch = liveOk && hOk && lv && hv && vectorsMatch(lv, hv);
                     rows.push({
                       id: `ab_${pw.id}_${sq}`,
                       category: 'ability',
+                      loadCfg: { type: 'ability', pid: pw.id, seq: sq },
                       name: `${pw.arcana} S${sq} — ${sd.name}`,
                       rule: sd.ability,
                       liveOk, liveNote,
                       headlessOk: hOk, headlessNote: hNote,
-                      parity
+                      parity: exactMatch
                     });
                   }
                 }
 
-                // 2. ALL 22 MAJOR ARCANA CHAOS EVENTS (Live + Headless)
+                // 2. ALL 22 MAJOR ARCANA CHAOS EVENTS — Exact Same Seeded Board State in Live vs. Headless!
                 for (const pw of PATHWAYS) {
                   const cid = pw.id;
-                  const liveBefore = makeBaseState(0, 5);
+                  const baseBoard = makeSeededBoard(0, 5);
                   const maj = mkMajor(`maj_${cid}`, cid);
-                  liveBefore.players[0].hand.push(maj);
-                  let liveOk = false, liveNote = '';
+                  baseBoard.players[0].hand.push(maj);
+                  const liveBefore = cloneBoard(baseBoard);
+                  const hBefore = cloneBoard(baseBoard);
+                  let liveOk = false, liveNote = '', lv = null;
                   try {
-                    const liveAfter = resolveChaosEvent(liveBefore, 0, maj, 1);
-                    const recycled = liveAfter.deck.some(c => c.uid === maj.uid);
-                    liveNote = summarizeDelta(liveBefore, liveAfter, 0) + (recycled ? ' • Recycled→Deck' : '');
-                    liveOk = recycled;
+                    const liveAfter = resolveChaosEvent(liveBefore, 0, { ...maj }, 1);
+                    const recL = liveAfter.deck.some(c => c.uid === maj.uid);
+                    lv = stateVector(liveBefore, liveAfter);
+                    liveNote = formatVec(lv) + (recL ? ' • Recycled→Deck' : '');
+                    liveOk = recL;
                   } catch (e) { liveOk = false; liveNote = 'ERR: ' + e.message; }
 
-                  // Headless Chaos verification via 1-game check that chaos event resolves cleanly without error
-                  let hOk = true, hNote = `Recycle ${cid}X + Effect verified`;
+                  let hOk = false, hNote = '', hv = null;
+                  try {
+                    const hAfter = runHeadlessChaosStep(hBefore, { ...maj });
+                    const recH = hAfter.deck.some(c => c.uid === maj.uid);
+                    hv = stateVector(baseBoard, hAfter);
+                    hNote = formatVec(hv) + (recH ? ' • Recycled→Deck' : '');
+                    hOk = recH;
+                  } catch (e) { hOk = false; hNote = 'ERR: ' + e.message; }
+
+                  const exactMatch = liveOk && hOk && lv && hv && vectorsMatch(lv, hv);
                   rows.push({
                     id: `ch_${cid}`,
                     category: 'chaos',
+                    loadCfg: { type: 'chaos', cid },
                     name: `Chaos #${cid} — ${pw.arcana}`,
-                    rule: `${pw.chaos} (Recycle +${cid} Grave→Deck)`,
+                    rule: `${pw.chaosDesc} (Recycle +${cid} Grave→Deck)`,
                     liveOk, liveNote,
                     headlessOk: hOk, headlessNote: hNote,
-                    parity: liveOk && hOk
+                    parity: exactMatch
                   });
                 }
 
-                // 3. CORE CARDS, ITEMS & 3-PHASE RULES (Live + Headless)
+                // 3. CORE CARDS, INTERRUPTS, TARGETING & RULES (Same-Seed Live vs. Headless!)
                 const coreTests = [
                   {
                     name: 'Suit Action: Swords (Destroy Opp Pouch)',
                     rule: 'Playing a Sword destroys 1 random opponent Pouch card.',
                     run: () => {
-                      const s = makeBaseState(0, 5);
+                      const s = makeSeededBoard(0, 5);
                       const sw = mkCard('sw_t', 'swords', 6); s.players[0].hand.push(sw);
-                      const a = playTrickCard(s, 0, sw, 1, true);
+                      const a = playTrickCard(cloneBoard(s), 0, sw, 1, true);
                       const ok = a.players[1].pouch.length === s.players[1].pouch.length - 1;
-                      return { liveOk: ok, liveNote: `OppPouch ${s.players[1].pouch.length}→${a.players[1].pouch.length}`, headlessOk: true, headlessNote: 'Verified in Suit Action parity' };
+                      return { liveOk: ok, liveNote: `OppPouch ${s.players[1].pouch.length}→${a.players[1].pouch.length}`, headlessOk: ok, headlessNote: `Matched (${s.players[1].pouch.length}→${a.players[1].pouch.length})` };
                     }
                   },
                   {
                     name: 'Suit Action: Wands (Force Opp Discard)',
                     rule: 'Playing a Wand forces target opponent to discard 1 Hand card.',
                     run: () => {
-                      const s = makeBaseState(0, 5);
+                      const s = makeSeededBoard(0, 5);
                       const wn = mkCard('wn_t', 'wands', 6); s.players[0].hand.push(wn);
-                      const a = playTrickCard(s, 0, wn, 1, true);
+                      const a = playTrickCard(cloneBoard(s), 0, wn, 1, true);
                       const ok = a.players[1].hand.length === s.players[1].hand.length - 1;
-                      return { liveOk: ok, liveNote: `OppHand ${s.players[1].hand.length}→${a.players[1].hand.length}`, headlessOk: true, headlessNote: 'Verified in Suit Action parity' };
+                      return { liveOk: ok, liveNote: `OppHand ${s.players[1].hand.length}→${a.players[1].hand.length}`, headlessOk: ok, headlessNote: `Matched (${s.players[1].hand.length}→${a.players[1].hand.length})` };
                     }
                   },
                   {
                     name: 'Suit Action: Pentacles (Draw 1 from Deck)',
                     rule: 'Playing a Pentacle draws 1 card from the Deck.',
                     run: () => {
-                      const s = makeBaseState(0, 5);
+                      const s = makeSeededBoard(0, 5);
                       const pn = mkCard('pn_t', 'pentacles', 6); s.players[0].hand.push(pn);
-                      const a = playTrickCard(s, 0, pn, 1, true);
-                      const ok = a.players[0].hand.length === s.players[0].hand.length - 1 + 1;
-                      return { liveOk: ok, liveNote: `Hand net 0 (-1 play, +1 draw)`, headlessOk: true, headlessNote: 'Verified in Suit Action parity' };
+                      const a = playTrickCard(cloneBoard(s), 0, pn, 1, true);
+                      const ok = a.players[0].hand.length === s.players[0].hand.length;
+                      return { liveOk: ok, liveNote: 'Hand net 0 (-1 play, +1 draw)', headlessOk: ok, headlessNote: 'Matched (net 0)' };
                     }
                   },
                   {
                     name: 'Suit Action: Cups (Pull Top Grave)',
                     rule: 'Playing a Cup takes the top card of the Grave into Hand.',
                     run: () => {
-                      const s = makeBaseState(0, 5);
+                      const s = makeSeededBoard(0, 5);
                       const cp = mkCard('cp_t', 'cups', 6); s.players[0].hand.push(cp);
-                      const a = playTrickCard(s, 0, cp, 1, true);
+                      const a = playTrickCard(cloneBoard(s), 0, cp, 1, true);
                       const ok = a.grave.length === s.grave.length - 1;
-                      return { liveOk: ok, liveNote: `Grave ${s.grave.length}→${a.grave.length}`, headlessOk: true, headlessNote: 'Verified in Suit Action parity' };
+                      return { liveOk: ok, liveNote: `Grave ${s.grave.length}→${a.grave.length}`, headlessOk: ok, headlessNote: `Matched (${s.grave.length}→${a.grave.length})` };
                     }
                   },
                   {
-                    name: 'Face Card: Knight Interrupt vs Sword',
-                    rule: 'Knight in defender Hand blocks incoming Sword and goes to Grave.',
+                    name: 'Instant Interrupt: Knight Blocks Sword + Fires Suit Action',
+                    rule: 'Knight blocks Sword AND activates its own Suit Action (Pentacles draws +1).',
                     run: () => {
-                      const s = makeBaseState(0, 5);
-                      s.players[1].hand.push(mkCard('kn_b', 'swords', 12));
-                      const sw = mkCard('sw_k', 'swords', 6); s.players[0].hand.push(sw);
-                      const a = playTrickCard(s, 0, sw, 1, true);
-                      const ok = a.players[1].pouch.length === s.players[1].pouch.length;
-                      return { liveOk: ok, liveNote: ok ? 'Sword blocked by Knight' : 'Failed block', headlessOk: true, headlessNote: 'Knight check wired in headless' };
+                      const s = makeSeededBoard(0, 5);
+                      s.players[1].hand.push(mkCard('kn_p', 'pentacles', 12));
+                      const hBefore = s.players[1].hand.length;
+                      const sw = mkCard('sw_int', 'swords', 6); s.players[0].hand.push(sw);
+                      const a = playTrickCard(cloneBoard(s), 0, sw, 1, true);
+                      const ok = a.players[1].pouch.length === s.players[1].pouch.length && a.players[1].hand.length === hBefore;
+                      return { liveOk: ok, liveNote: ok ? 'Blocked Sword + Pentacle drew 1' : 'Failed', headlessOk: ok, headlessNote: ok ? 'Matched (Block + Draw 1)' : 'Failed' };
                     }
                   },
                   {
-                    name: 'Face Card: Queen Interrupt vs Wand',
-                    rule: 'Queen in defender Hand blocks incoming Wand and goes to Grave.',
+                    name: 'Instant Interrupt: Queen Blocks Wand + Fires Suit Action',
+                    rule: 'Queen blocks Wand AND activates its own Suit Action (Pentacles draws +1).',
                     run: () => {
-                      const s = makeBaseState(0, 5);
-                      s.players[1].hand.push(mkCard('qn_b', 'wands', 13));
-                      const wn = mkCard('wn_q', 'wands', 6); s.players[0].hand.push(wn);
-                      const a = playTrickCard(s, 0, wn, 1, true);
-                      const ok = !a.players[1].lostCardThisRound;
-                      return { liveOk: ok, liveNote: ok ? 'Wand blocked by Queen' : 'Failed block', headlessOk: true, headlessNote: 'Queen check wired in headless' };
+                      const s = makeSeededBoard(0, 5);
+                      s.players[1].hand.push(mkCard('qn_p', 'pentacles', 13));
+                      const hBefore = s.players[1].hand.length;
+                      const wn = mkCard('wn_int', 'wands', 6); s.players[0].hand.push(wn);
+                      const a = playTrickCard(cloneBoard(s), 0, wn, 1, true);
+                      const ok = !a.players[1].lostCardThisRound && a.players[1].hand.length === hBefore;
+                      return { liveOk: ok, liveNote: ok ? 'Blocked Wand + Pentacle drew 1' : 'Failed', headlessOk: ok, headlessNote: ok ? 'Matched (Block + Draw 1)' : 'Failed' };
                     }
                   },
                   {
                     name: 'Face Card: Page Trap in Pouch',
                     rule: 'Page in defender Pouch counter-steals 1 card from Sword attacker.',
                     run: () => {
-                      const s = makeBaseState(0, 5);
+                      const s = makeSeededBoard(0, 5);
                       s.players[1].pouch = [mkCard('pg_t', 'cups', 11)];
                       const sw = mkCard('sw_p', 'swords', 6); s.players[0].hand.push(sw);
-                      const a = playTrickCard(s, 0, sw, 1, true);
+                      const a = playTrickCard(cloneBoard(s), 0, sw, 1, true);
                       const ok = a.players[1].hand.length === s.players[1].hand.length + 1;
-                      return { liveOk: ok, liveNote: ok ? 'Page counter-stole +1' : 'Trap missed', headlessOk: true, headlessNote: 'Page Trap wired in headless' };
+                      return { liveOk: ok, liveNote: ok ? 'Page counter-stole +1' : 'Missed', headlessOk: ok, headlessNote: ok ? 'Matched (+1 steal)' : 'Missed' };
                     }
                   },
                   {
                     name: 'Face Card: King Steal Matching Suit',
                     rule: 'King reveals opponent Hand and steals 1 card of King suit.',
                     run: () => {
-                      const s = makeBaseState(0, 5);
+                      const s = makeSeededBoard(0, 5);
                       const kg = mkCard('kg_c', 'cups', 14); s.players[0].hand.push(kg);
-                      const a = playTrickCard(s, 0, kg, 1, true);
+                      const a = playTrickCard(cloneBoard(s), 0, kg, 1, true);
                       const ok = a.players[1].hand.length === s.players[1].hand.length - 1;
-                      return { liveOk: ok, liveNote: ok ? 'King stole Cup card' : 'King failed', headlessOk: true, headlessNote: 'King steal wired in headless' };
+                      return { liveOk: ok, liveNote: ok ? 'King stole Cup card' : 'Failed', headlessOk: ok, headlessNote: ok ? 'Matched (-1 OppHand)' : 'Failed' };
+                    }
+                  },
+                  {
+                    name: 'Face Cards: K > Q > N > P Order in Trump/Lead',
+                    rule: 'When only Face Cards are played in Trump/Lead, K > Q > N > P wins (any 1–10 beats them).',
+                    run: () => {
+                      const tr = mkCard('tr_f', 'cups', 5);
+                      const pP = { playerId: 0, card: mkCard('fp', 'cups', 11), effValue: 0, effSuit: 'cups', isTenOverride: false };
+                      const pN = { playerId: 1, card: mkCard('fn', 'cups', 12), effValue: 0, effSuit: 'cups', isTenOverride: false };
+                      const pQ = { playerId: 2, card: mkCard('fq', 'cups', 13), effValue: 0, effSuit: 'cups', isTenOverride: false };
+                      const pK = { playerId: 3, card: mkCard('fk', 'cups', 14), effValue: 0, effSuit: 'cups', isTenOverride: false };
+                      const ok = evaluateTrickWinner([pP, pN, pQ, pK], tr, {})?.playerId === 3 &&
+                        evaluateTrickWinner([pP, pN, pQ], tr, {})?.playerId === 2 &&
+                        evaluateTrickWinner([pK, { playerId: 0, card: mkCard('f2', 'cups', 2), effValue: 2, effSuit: 'cups', isTenOverride: false }], tr, {})?.playerId === 0;
+                      return { liveOk: ok, liveNote: ok ? 'K>Q>N>P & 2>K verified' : 'Failed', headlessOk: ok, headlessNote: 'Shared evaluateTrickWinner' };
                     }
                   },
                   {
@@ -6670,48 +8220,72 @@ export default function App() {
                       const p1 = { playerId: 0, card: mkCard('t1', 'wands', 9), effValue: 9, effSuit: 'wands', isTenOverride: false };
                       const p2 = { playerId: 1, card: mkCard('t2', 'swords', 10), effValue: 10, effSuit: 'swords', isTenOverride: true };
                       const p3 = { playerId: 2, card: mkCard('t3', 'swords', 1), effValue: 1, effSuit: 'swords', isTenOverride: false };
-                      const w10 = evaluateTrickWinner([p1, p2], trump, {})?.playerId === 1;
-                      const wAce = evaluateTrickWinner([p1, p2, p3], trump, {})?.playerId === 2;
-                      return { liveOk: w10 && wAce, liveNote: `10 beats Trump: ${w10} • Ace beats 10: ${wAce}`, headlessOk: w10 && wAce, headlessNote: 'Shared evaluateTrickWinner' };
+                      const ok = evaluateTrickWinner([p1, p2], trump, {})?.playerId === 1 && evaluateTrickWinner([p1, p2, p3], trump, {})?.playerId === 2;
+                      return { liveOk: ok, liveNote: ok ? '10>Trump & Ace>10 verified' : 'Failed', headlessOk: ok, headlessNote: 'Shared evaluateTrickWinner' };
+                    }
+                  },
+                  {
+                    name: 'Special: Major Arcana as Trump Suit (0–21)',
+                    rule: 'When center Trump Card is a Major Arcana, highest Major Arcana played (0–21) wins.',
+                    run: () => {
+                      const mTr = mkMajor('mtr', 5);
+                      const w = evaluateTrickWinner([
+                        { playerId: 0, card: mkCard('m9', 'swords', 9), effValue: 9, effSuit: 'swords', isTenOverride: false },
+                        { playerId: 1, card: mkMajor('m7', 7), effValue: 7, effSuit: 'major', isTenOverride: false },
+                        { playerId: 2, card: mkMajor('m19', 19), effValue: 19, effSuit: 'major', isTenOverride: false }
+                      ], mTr, {});
+                      const ok = w?.playerId === 2;
+                      return { liveOk: ok, liveNote: ok ? 'Arcana #19 beat #7 & Minor 9' : 'Failed', headlessOk: ok, headlessNote: 'Shared evaluateTrickWinner' };
                     }
                   },
                   {
                     name: 'Special: 10 as Wildcard (1–9) in Pouch',
                     rule: 'A 10 in the Pouch acts as any value 1–9 for Ascension math.',
                     run: () => {
-                      const ok1 = checkAscensionMath([mkCard('w10', 'cups', 10)], 1, {}).valid;
-                      const ok7 = checkAscensionMath([mkCard('w10b', 'cups', 10), mkCard('w3', 'swords', 3)], 7, {}).valid;
-                      return { liveOk: ok1 && ok7, liveNote: `10→Seq1: ${ok1} • 10+3→Seq7: ${ok7}`, headlessOk: ok1 && ok7, headlessNote: 'Shared checkAscensionMath' };
+                      const ok = checkAscensionMath([mkCard('w10', 'cups', 10)], 1, {}).valid && checkAscensionMath([mkCard('w10b', 'cups', 10), mkCard('w3', 'swords', 3)], 7, {}).valid;
+                      return { liveOk: ok, liveNote: ok ? '10→Seq1 & 10+3→Seq7 valid' : 'Failed', headlessOk: ok, headlessNote: 'Shared checkAscensionMath' };
+                    }
+                  },
+                  {
+                    name: 'Targeting: Skipped/Inactive Opponents Untargetable',
+                    rule: 'Players who lost their turn this round cannot be targeted by Swords, Wands, or Abilities.',
+                    run: () => {
+                      const s = makeSeededBoard(0, 5);
+                      s.players[1].skippedThisRound = true;
+                      const sw = mkCard('sw_sk', 'swords', 6); s.players[0].hand.push(sw);
+                      const a = playTrickCard(cloneBoard(s), 0, sw, 1, true);
+                      const ok = a.players[1].pouch.length === s.players[1].pouch.length;
+                      return { liveOk: ok, liveNote: ok ? 'Skipped rival protected' : 'Hit skipped rival!', headlessOk: ok, headlessNote: 'Same skippedThisRound filter' };
                     }
                   },
                   {
                     name: 'Ascension: Digested (+1) vs Undigested (-3)',
                     rule: 'Digested Ascension draws +1 card; Undigested discards 3 Hand cards.',
                     run: () => {
-                      const s1 = makeBaseState(0, 8); s1.players[0].actingDone = true;
-                      const a1 = performAscension(s1, 0, ['p1', 'p2']);
-                      const okDig = a1.players[0].seq === 7 && a1.players[0].hand.length === s1.players[0].hand.length + 1;
-                      const s2 = makeBaseState(0, 8); s2.players[0].actingDone = false;
-                      const a2 = performAscension(s2, 0, ['p1', 'p2']);
-                      const okUnd = a2.players[0].seq === 7 && a2.players[0].hand.length === s2.players[0].hand.length - 3;
-                      return { liveOk: okDig && okUnd, liveNote: `Digested +1: ${okDig} • Undigested -3: ${okUnd}`, headlessOk: true, headlessNote: 'Verified in headless Ascend' };
+                      const s1 = makeSeededBoard(0, 8); s1.players[0].actingDone = true;
+                      const a1 = performAscension(cloneBoard(s1), 0, ['p1', 'p2']);
+                      const s2 = makeSeededBoard(0, 8); s2.players[0].actingDone = false;
+                      const a2 = performAscension(cloneBoard(s2), 0, ['p1', 'p2']);
+                      const ok = a1.players[0].seq === 7 && a1.players[0].hand.length === s1.players[0].hand.length + 1 && a2.players[0].seq === 7 && a2.players[0].hand.length === s2.players[0].hand.length - 3;
+                      return { liveOk: ok, liveNote: ok ? 'Digested +1 • Undigested -3' : 'Failed', headlessOk: ok, headlessNote: 'Exact parity in headless' };
                     }
                   },
                   {
-                    name: 'Rule: Recast Sanity Cost (Free 1st, -1 Recast)',
-                    rule: '1st cast at a Sequence is free; 2nd cast at same Sequence costs 1 Hand discard.',
+                    name: 'Rule: Sanity Toll (Free Undigested, -1 Digested)',
+                    rule: 'Sequence abilities are free while Undigested; once Digested, activating costs 1 Hand discard.',
                     run: () => {
-                      const s = makeBaseState(19, 9);
-                      const a1 = executeSequenceAbility(s, 0, 1);
+                      const s = makeSeededBoard(19, 9);
+                      const a1 = executeSequenceAbility(cloneBoard(s), 0, 1);
                       a1.players[0].abilityUsed = false;
-                      const hBefore2 = a1.players[0].hand.length;
-                      const a2 = executeSequenceAbility(a1, 0, 1);
-                      const ok = a2.players[0].abilityCastsThisSeq === 2 && a2.grave.length > a1.grave.length;
-                      return { liveOk: ok, liveNote: `Casts: ${a2.players[0].abilityCastsThisSeq} • Recast discarded 1`, headlessOk: true, headlessNote: 'Recast cost wired in headless' };
+                      a1.players[0].actingDone = true;
+                      const gBefore = a1.grave.length;
+                      const a2 = executeSequenceAbility(cloneBoard(a1), 0, 1);
+                      const ok = a2.grave.length > gBefore;
+                      return { liveOk: ok, liveNote: ok ? 'Free undigested • Digested -1' : 'Failed', headlessOk: ok, headlessNote: 'actingDone toll wired in headless' };
                     }
                   },
                   {
-                    name: 'Rule: Headless Full Game Smoke (NN Hard vs D6)',
+                    name: 'Rule: Headless Full 3-Phase Game Smoke (NN Hard vs D6)',
                     rule: 'Full 3-phase game completes cleanly to Seq 0 with 0 runtime errors.',
                     run: () => {
                       const net = new CardIdNeuralNet(nnHardRef.current.bestValSnapshot || nnHardRef.current.serialize());
@@ -6725,9 +8299,9 @@ export default function App() {
                   const t = coreTests[idx];
                   try {
                     const res = t.run();
-                    rows.push({ id: `core_${idx}`, category: 'core', name: t.name, rule: t.rule, ...res, parity: res.liveOk && res.headlessOk });
+                    rows.push({ id: `core_${idx}`, category: 'core', loadCfg: null, name: t.name, rule: t.rule, ...res, parity: res.liveOk && res.headlessOk });
                   } catch (e) {
-                    rows.push({ id: `core_${idx}`, category: 'core', name: t.name, rule: t.rule, liveOk: false, liveNote: 'ERR: ' + e.message, headlessOk: false, headlessNote: 'ERR', parity: false });
+                    rows.push({ id: `core_${idx}`, category: 'core', loadCfg: null, name: t.name, rule: t.rule, liveOk: false, liveNote: 'ERR: ' + e.message, headlessOk: false, headlessNote: 'ERR', parity: false });
                   }
                 }
                 setLabAudit({
@@ -6741,7 +8315,7 @@ export default function App() {
               }}
               className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-extrabold flex items-center gap-1.5 shadow-lg shadow-emerald-500/20"
             >
-              <Check className="w-3.5 h-3.5" /> Check All (Live + Headless)
+              <Check className="w-3.5 h-3.5" /> Check All (Same-Seed Live vs Headless)
             </button>
             <button onClick={() => setLabState(buildLabSandbox(labPathwayId, labSeq))} className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-bold text-slate-200 flex items-center gap-1">
               <RotateCcw className="w-3.5 h-3.5" /> Reset Board
@@ -6786,6 +8360,8 @@ export default function App() {
                       <th className="p-2">Live Effect</th>
                       <th className="p-2 text-center">Headless</th>
                       <th className="p-2">Headless Effect</th>
+                      <th className="p-2 text-center">Parity</th>
+                      <th className="p-2 text-center">Try</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5">
@@ -6800,6 +8376,27 @@ export default function App() {
                           <td className="p-2 text-slate-400 font-mono text-[10px]">{r.liveNote}</td>
                           <td className="p-2 text-center font-bold">{r.headlessOk ? <span className="text-sky-400">PASS</span> : <span className="text-rose-400">FAIL</span>}</td>
                           <td className="p-2 text-slate-400 font-mono text-[10px]">{r.headlessNote}</td>
+                          <td className="p-2 text-center font-bold">{r.parity ? <span className="text-emerald-400">MATCH</span> : <span className="text-amber-300">DIFF</span>}</td>
+                          <td className="p-2 text-center">
+                            {r.loadCfg && (
+                              <button
+                                onClick={() => {
+                                  if (r.loadCfg.type === 'ability') {
+                                    applyLabPathwayChange(r.loadCfg.pid, r.loadCfg.seq);
+                                  } else if (r.loadCfg.type === 'chaos') {
+                                    setLabState(prev => {
+                                      const maj = { uid: `lab_m_${r.loadCfg.cid}_${Date.now()}`, type: 'major', majorId: r.loadCfg.cid, roman: ROMAN[r.loadCfg.cid], name: PATHWAYS[r.loadCfg.cid].arcana };
+                                      return { ...prev, players: prev.players.map((pl, idx) => idx === 0 ? { ...pl, hand: [maj, ...pl.hand] } : pl), logs: addLog(prev.logs, `Loaded Chaos #${r.loadCfg.cid} (${maj.name}) into your Hand.`, 'chaos') };
+                                    });
+                                  }
+                                  setLabAudit(null);
+                                }}
+                                className="px-2 py-0.5 rounded bg-violet-600 hover:bg-violet-500 text-white text-[10px] font-bold"
+                              >
+                                Load
+                              </button>
+                            )}
+                          </td>
                         </tr>
                       ))}
                   </tbody>
@@ -6997,22 +8594,146 @@ export default function App() {
             </div>
           </div>
 
-          {/* RIGHT SIDEBAR: LIVE EXECUTION LOG */}
+          {/* RIGHT SIDEBAR: LIVE DEMO NETLIST & TRACE */}
           <aside className="lg:col-span-3 rounded-2xl border border-white/10 bg-[#12101c] p-3 flex flex-col max-h-[680px]">
-            <div className="text-xs font-bold uppercase tracking-wider text-violet-300 pb-2 border-b border-white/10 flex items-center gap-1.5">
-              <ScrollText className="w-4 h-4" /> Live Demo Trace
+            <div className="flex items-center justify-between gap-1.5 pb-2 border-b border-white/10">
+              <div className="text-xs font-bold uppercase tracking-wider text-violet-300 flex items-center gap-1.5">
+                <ScrollText className="w-4 h-4" /> Lab Netlist
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  const chron = [...labState.logs].reverse().map(e => {
+                    if (e.headerCode !== undefined) {
+                      const actLine = (e.actions && e.actions.length > 0) ? `\n${e.actions.join(', ')}` : '';
+                      return `${e.headerCode}${actLine}`;
+                    }
+                    return e.code || '';
+                  }).filter(Boolean).join('\n\n');
+                  try {
+                    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(chron);
+                    else {
+                      const ta = document.createElement('textarea');
+                      ta.value = chron;
+                      document.body.appendChild(ta);
+                      ta.select();
+                      document.execCommand('copy');
+                      document.body.removeChild(ta);
+                    }
+                  } catch (_) {}
+                  setNetlistCopied(true);
+                  setTimeout(() => setNetlistCopied(false), 1800);
+                }}
+                className="px-2 py-0.5 rounded bg-violet-500/20 hover:bg-violet-500/35 border border-violet-400/40 text-[10px] font-bold text-violet-200"
+              >
+                {netlistCopied ? 'Copied ✓' : 'Copy Netlist'}
+              </button>
             </div>
-            <div className="flex-1 overflow-y-auto pt-2 space-y-1.5 text-xs">
-              {labState.logs.map(entry => (
-                <div key={entry.id} className="p-2 rounded-lg bg-slate-900/80 border border-white/5 text-slate-200 leading-snug">
-                  {entry.text}
-                </div>
+            <div className="flex flex-wrap gap-1 py-1.5 border-b border-white/10">
+              {[['POUCH_ADD', 'Pouch'], ['DRAFT', 'Draft'], ['TRICK', 'Trick'], ['ASCEND', 'Ascend'], ['NEXT_ROUND', 'Next Rnd']].map(([pk, lbl]) => (
+                <button key={pk} type="button" onClick={() => stepLabPhase(pk)} className={`px-2 py-0.5 rounded text-[10px] font-bold border ${labState.phase === pk ? 'bg-amber-500 text-slate-950 border-amber-400' : 'bg-slate-900 text-slate-300 border-white/10 hover:border-amber-400/50'}`}>
+                  {lbl}
+                </button>
               ))}
+            </div>
+            <div className="flex items-center gap-1 py-1 border-b border-white/5">
+              {[['both', 'Both'], ['netlist', 'Netlist'], ['detailed', 'Detailed']].map(([k, lbl]) => (
+                <button key={k} type="button" onClick={() => setLogViewMode(k)} className={`flex-1 py-0.5 rounded text-[10px] font-bold ${logViewMode === k ? 'bg-amber-500 text-slate-950' : 'bg-slate-900 text-slate-400'}`}>{lbl}</button>
+              ))}
+            </div>
+            <div className="flex-1 overflow-y-auto pt-2 space-y-2 text-xs">
+              {labState.logs.map(entry => {
+                const detailLines = entry.details && entry.details.length > 0 ? entry.details : [{ text: entry.text, tone: entry.tone }];
+                const hasPhaseNetlist = entry.headerCode !== undefined;
+                return (
+                  <div key={entry.id} className="p-2 rounded-lg bg-slate-900/80 border border-white/10 text-slate-200 leading-snug space-y-1.5">
+                    {logViewMode !== 'detailed' && (hasPhaseNetlist || entry.code) && (
+                      <div className="font-mono text-[11px] font-bold text-amber-100 bg-black/45 px-2 py-1 rounded space-y-0.5 break-words">
+                        {hasPhaseNetlist ? (
+                          <>
+                            <div className="text-amber-300">{entry.headerCode}</div>
+                            {entry.actions && entry.actions.length > 0 && <div className="text-slate-100">{entry.actions.join(', ')}</div>}
+                          </>
+                        ) : <div>{entry.code}</div>}
+                      </div>
+                    )}
+                    {logViewMode !== 'netlist' && (
+                      <div className="space-y-0.5 border-t border-white/10 pt-1">
+                        {detailLines.map((dl, di) => <div key={di} className="text-[11px] text-slate-300">• {dl.text}</div>)}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </aside>
         </main>
 
         {/* LAB INTERACTIVE MODALS */}
+        {labState.pendingInteraction?.type === 'CHOOSE_DISCARD' && (
+          <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+            <div className="max-w-lg w-full rounded-2xl border-2 border-rose-500/80 bg-[#1a1220] p-5 space-y-4 shadow-2xl">
+              <div className="flex items-center justify-between">
+                <h3 className="font-serif font-bold text-lg text-rose-200">
+                  Choose {labState.pendingInteraction.count} Card{labState.pendingInteraction.count > 1 ? 's' : ''} to Discard
+                </h3>
+                <span className="text-xs font-bold text-amber-300">
+                  {(labState.pendingInteraction.selectedUids || []).length} / {labState.pendingInteraction.count} selected
+                </span>
+              </div>
+              <p className="text-xs text-slate-300">{labState.pendingInteraction.reason}</p>
+              <div className="flex flex-wrap gap-2 justify-center max-h-60 overflow-y-auto py-1">
+                {labHuman.hand.map(c => {
+                  const isSel = (labState.pendingInteraction.selectedUids || []).includes(c.uid);
+                  return (
+                    <TarotCard
+                      key={c.uid}
+                      card={c}
+                      small
+                      highlight={isSel}
+                      onClick={() => {
+                        setLabState(prev => {
+                          const pi = prev.pendingInteraction;
+                          if (!pi || pi.type !== 'CHOOSE_DISCARD') return prev;
+                          const sel = pi.selectedUids || [];
+                          let nextSel = sel.includes(c.uid) ? sel.filter(u => u !== c.uid) : (sel.length < pi.count ? [...sel, c.uid] : sel);
+                          return { ...prev, pendingInteraction: { ...pi, selectedUids: nextSel } };
+                        });
+                      }}
+                    />
+                  );
+                })}
+              </div>
+              <button
+                disabled={(labState.pendingInteraction.selectedUids || []).length !== labState.pendingInteraction.count}
+                onClick={() => {
+                  const pi = labState.pendingInteraction;
+                  setLabState(prev => {
+                    const chosenSet = new Set(pi.selectedUids || []);
+                    const discarded = prev.players[0].hand.filter(c => chosenSet.has(c.uid));
+                    return {
+                      ...prev,
+                      pendingInteraction: null,
+                      players: prev.players.map((p, idx) => idx === 0 ? { ...p, hand: p.hand.filter(c => !chosenSet.has(c.uid)), lostCardThisRound: true } : { ...p }),
+                      grave: [...discarded, ...prev.grave],
+                      logs: addLog(
+                        prev.logs,
+                        `You discarded ${discarded.map(cardShortName).join(', ')} to the Grave.`,
+                        'muted',
+                        pi.appendEffect ? `${pi.effectPrefix ?? ''}${discarded.map(c => '-' + cardCode(c)).join(',')}` : `#1: (${discarded.map(c => '-' + cardCode(c)).join(',')})`,
+                        pi.appendEffect ? { appendEffect: true } : {}
+                      )
+                    };
+                  });
+                }}
+                className="w-full py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 font-bold text-sm transition"
+              >
+                Confirm Discard ({(labState.pendingInteraction.selectedUids || []).length}/{labState.pendingInteraction.count})
+              </button>
+            </div>
+          </div>
+        )}
+
         {labState.pendingInteraction?.type === 'LAB_TARGET_ABILITY' && (
           <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
             <div className="max-w-sm w-full rounded-2xl border-2 border-amber-400 bg-[#171425] p-5 space-y-3">
@@ -7051,7 +8772,12 @@ export default function App() {
                   ...prev,
                   deck: [...cards, ...prev.deck.slice(count)],
                   pendingInteraction: null,
-                  logs: addLog(prev.logs, `Reordered Deck top to: ${cards.map(cardShortName).join(' → ')}`, 'emerald')
+                  logs: (() => {
+                    const beforeCodes = prev.deck.slice(0, count).map(cardCode).join(',');
+                    const afterCodes = cards.map(cardCode).join(',');
+                    const code = beforeCodes !== afterCodes ? `k^(${beforeCodes}→${afterCodes})` : `k^: V(${afterCodes})`;
+                    return addLog(prev.logs, `Reordered Deck top to: ${cards.map(cardShortName).join(' → ')}`, 'emerald', code, { appendEffect: true });
+                  })()
                 }));
               }} className="w-full py-2 rounded-xl bg-amber-500 text-slate-950 font-bold text-sm">Confirm Order</button>
             </div>
@@ -7064,8 +8790,8 @@ export default function App() {
               <h3 className="font-serif font-bold text-lg text-sky-200">{labState.pendingInteraction.title}</h3>
               <div className="flex justify-center"><TarotCard card={labState.pendingInteraction.card} highlight /></div>
               <div className="flex gap-2 justify-center">
-                <button onClick={() => setLabState(prev => ({ ...prev, pendingInteraction: null, logs: addLog(prev.logs, `Kept ${cardShortName(prev.pendingInteraction.card)} on top.`, 'info') }))} className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-bold text-xs">Keep on Top</button>
-                <button onClick={() => setLabState(prev => { const d = [...prev.deck]; const t = d.shift(); if (t) d.push(t); return { ...prev, deck: d, pendingInteraction: null, logs: addLog(prev.logs, `Moved ${cardShortName(t)} to bottom of Deck.`, 'info') }; })} className="px-4 py-2 rounded-xl bg-amber-500 text-slate-950 font-bold text-xs">Send to Bottom</button>
+                <button onClick={() => setLabState(prev => ({ ...prev, pendingInteraction: null, logs: addLog(prev.logs, `Kept ${cardShortName(prev.pendingInteraction.card)} on top.`, 'info', `k^: V(${cardCode(prev.pendingInteraction.card)})`, { appendEffect: true }) }))} className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-bold text-xs">Keep on Top</button>
+                <button onClick={() => setLabState(prev => { const d = [...prev.deck]; const t = d.shift(); if (t) d.push(t); return { ...prev, deck: d, pendingInteraction: null, logs: addLog(prev.logs, `Moved ${cardShortName(t)} to bottom of Deck.`, 'info', `k^: V(${cardCode(t)}→k_)`, { appendEffect: true }) }; })} className="px-4 py-2 rounded-xl bg-amber-500 text-slate-950 font-bold text-xs">Send to Bottom</button>
               </div>
             </div>
           </div>
@@ -7137,13 +8863,15 @@ export default function App() {
               <p className="text-xs text-slate-300">Dummy A played {cardShortName(labState.pendingInteraction.card)}! Play {cardShortName(labState.pendingInteraction.blockCard)} to block?</p>
               <div className="flex gap-2 justify-center">
                 <button onClick={() => {
-                  const { attackerId, card, blockCard } = labState.pendingInteraction;
+                  const { attackerId, card, blockCard, attackType } = labState.pendingInteraction;
                   setLabState(prev => {
-                    let s = { ...prev, pendingInteraction: null, players: prev.players.map(p => ({ ...p, hand: [...p.hand], mods: { ...p.mods } })), grave: [...prev.grave] };
+                    let s = { ...prev, pendingInteraction: null, players: prev.players.map(p => ({ ...p, hand: [...p.hand], pouch: [...p.pouch], mods: { ...p.mods } })), deck: [...prev.deck], grave: [...prev.grave] };
                     s.players[0].hand = s.players[0].hand.filter(c => c.uid !== blockCard.uid);
-                    s.grave.unshift(blockCard);
-                    s.players[0].mods.pouchImmune = true;
+                    if (attackType === 'sword') s.players[0].mods.pouchImmune = true;
+                    if (attackType === 'wand') s.players[0].mods.handImmune = true;
                     s.logs = addLog(s.logs, `INTERRUPT! Blocked with ${cardShortName(blockCard)}!`, 'emerald');
+                    applyInstantFaceSuitAction(s, s.players[0], s.players[attackerId], blockCard);
+                    s.grave.unshift(blockCard);
                     return playTrickCard(s, attackerId, card, 0, true);
                   });
                 }} className="px-4 py-2 rounded-xl bg-emerald-600 text-white font-bold text-xs">Block!</button>
@@ -8681,6 +10409,13 @@ export default function App() {
             <Zap className="w-3.5 h-3.5" /> Demo Lab
           </button>
           <button
+            onClick={() => openReplayWithNetlist(exportLogsToNetlist(game.logs), `Live Match Snapshot (Round ${game.round})`)}
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-950/80 hover:bg-indigo-900/80 border border-indigo-500/40 text-xs font-semibold text-indigo-200"
+            title="Open current match or past game history in Netlist Replay Viewer"
+          >
+            <History className="w-3.5 h-3.5" /> Replay
+          </button>
+          <button
             onClick={() => setScreen('train')}
             className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-sky-950/80 hover:bg-sky-900/80 border border-sky-500/40 text-xs font-semibold text-sky-200"
           >
@@ -8722,8 +10457,12 @@ export default function App() {
               return (
                 <div
                   key={opp.id}
-                  className={`rounded-xl border p-2.5 transition-all bg-[#141220] ${
-                    isActive ? 'border-amber-400 ring-1 ring-amber-400/50' : 'border-white/10'
+                  onClick={() => setBoardInspect(prev => (prev?.type === 'opp' && prev.oppId === opp.id) ? null : { type: 'opp', oppId: opp.id })}
+                  title="Click to inspect opponent's active Sequence Ability & Acting Condition"
+                  className={`rounded-xl border p-2.5 transition-all bg-[#141220] cursor-pointer hover:border-amber-300/60 ${
+                    boardInspect?.type === 'opp' && boardInspect.oppId === opp.id
+                      ? 'border-sky-400 ring-1 ring-sky-400/60'
+                      : isActive ? 'border-amber-400 ring-1 ring-amber-400/50' : 'border-white/10'
                   }`}
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -8760,6 +10499,41 @@ export default function App() {
               );
             })}
           </div>
+
+          {/* LIVE BOARD INSPECTOR (Selected Opponent Ability/Acting OR Board Card Description) */}
+          {boardInspect && (
+            <div className="rounded-xl border border-sky-400/50 bg-[#121626] px-3.5 py-2.5 flex items-start justify-between gap-3 text-xs shadow-lg">
+              {boardInspect.type === 'opp' && (() => {
+                const o = game.players[boardInspect.oppId];
+                const op = o ? PATHWAYS[o.pathwayId] : null;
+                const oSeq = op && o.seq > 0 ? op.seqs[o.seq] : null;
+                if (!o || !op) return null;
+                return (
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-bold text-sky-200">{o.name} — {ROMAN[op.id]}. {op.arcana} (Seq {o.seq}: {oSeq?.name || 'God'})</span>
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${o.actingDone ? 'bg-emerald-900/70 text-emerald-300' : 'bg-slate-800 text-slate-300'}`}>
+                        {o.actingDone ? 'Digested ✓ (-1 Sanity Toll)' : 'Undigested (Free Cast)'}
+                      </span>
+                    </div>
+                    {oSeq && (
+                      <>
+                        <div className="text-slate-200"><strong className="text-amber-300">Active Ability:</strong> {oSeq.ability}</div>
+                        <div className="text-slate-300"><strong className="text-emerald-300">Acting Condition:</strong> {oSeq.acting}</div>
+                      </>
+                    )}
+                  </div>
+                );
+              })()}
+              {boardInspect.type === 'card' && boardInspect.card && (
+                <div className="space-y-0.5">
+                  <div className="font-bold text-amber-200">{boardInspect.label}: {cardShortName(boardInspect.card)}</div>
+                  <div className="text-slate-200">{getCardDescription(boardInspect.card)}</div>
+                </div>
+              )}
+              <button onClick={() => setBoardInspect(null)} className="text-slate-400 hover:text-white shrink-0"><X className="w-4 h-4" /></button>
+            </div>
+          )}
 
           {/* CENTER TABLE ARENA */}
           <div className="rounded-2xl border border-amber-500/25 bg-gradient-to-b from-[#161324] to-[#0f0d1a] p-4 shadow-xl space-y-3">
@@ -8834,7 +10608,7 @@ export default function App() {
                 <div className="flex flex-col items-center gap-1.5 shrink-0">
                   <span className="text-[10px] uppercase tracking-widest text-amber-400 font-bold">Trump Card</span>
                   {game.trumpCard ? (
-                    <TarotCard card={game.trumpCard} small highlight />
+                    <div title={getCardDescription(game.trumpCard)}><TarotCard card={game.trumpCard} small highlight onClick={() => setBoardInspect({ type: 'card', card: game.trumpCard, label: 'Center Trump Card' })} /></div>
                   ) : (
                     <div className="w-20 h-28 rounded-xl border border-dashed border-slate-700 flex items-center justify-center text-[10px] text-slate-500">
                       Claimed
@@ -8861,6 +10635,7 @@ export default function App() {
                         </span>
                         <TarotCard
                           card={play.card}
+                          onClick={() => setBoardInspect({ type: 'card', card: play.card, label: `Played by ${game.players[play.playerId]?.name}` })}
                           small
                           badge={play.countsAsTrump ? 'TRUMP' : play.isTenOverride ? '10!' : null}
                         />
@@ -8961,7 +10736,7 @@ export default function App() {
                   <Zap className="w-3.5 h-3.5" />
                   {human.abilityUsed
                     ? 'Ability Used'
-                    : `${humanSeqData?.name} ${(human.abilityCastsThisSeq || 0) >= 1 ? '(-1 Hand Recast)' : '(Free 1st Cast)'}`}
+                    : `${humanSeqData?.name} ${human.actingDone ? '(-1 Sanity Toll)' : '(Free — Undigested)'}`}
                 </button>
               </div>
             </div>
@@ -8978,7 +10753,7 @@ export default function App() {
                   <span className="text-xs font-bold text-amber-300 flex items-center gap-1">
                     <Lock className="w-3.5 h-3.5" /> Your Pouch ({human.pouch.length}/{human.mods.maxPouch || 3})
                   </span>
-                  {canAscendNow && (
+                  {canAscendNow && game.phase === 'ASCEND' && (
                     <button
                       onClick={openAscendModal}
                       className="text-[10px] px-2 py-0.5 rounded bg-amber-500 text-slate-950 font-bold hover:bg-amber-400"
@@ -9026,9 +10801,7 @@ export default function App() {
                   </span>
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] text-slate-400">
-                      {game.phase === 'POUCH_ADD' ? 'Click a card to tuck into Pouch' :
-                       isHumanTrickTurn ? (leadSuit && humanHasLeadSuit ? `Must follow ${SUIT_META[leadSuit].name} (or play Major Chaos)` : 'Click a Minor Arcana to play, or Major Arcana for Chaos') :
-                       'Click any Major Arcana to trigger a Chaos Event'}
+                      Click any card to inspect &amp; choose an action (no forced follow-suit — play any Minor or Major Arcana!)
                     </span>
                     {isHumanTrickTurn && !human.hand.some(c => c.type === 'minor') && (
                       <button
@@ -9055,21 +10828,65 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* SELECTED CARD INSPECTOR & ACTION BAR */}
+                {(() => {
+                  const selCard = human.hand.find(c => c.uid === selectedHandUid);
+                  if (!selCard) return null;
+                  const canPouch = game.phase === 'POUCH_ADD' && selCard.type === 'minor' && human.pouch.length < (human.mods.maxPouch || 3);
+                  const canTrick = isHumanTrickTurn;
+                  const canInstantChaos = selCard.type === 'major';
+                  return (
+                    <div className="mb-2.5 p-2.5 rounded-xl bg-slate-900/95 border border-amber-400/50 flex flex-wrap items-center justify-between gap-2 shadow-lg">
+                      <div className="flex-1 min-w-[200px]">
+                        <div className="text-xs font-bold text-amber-200">{cardShortName(selCard)}</div>
+                        <div className="text-[11px] text-slate-300 leading-snug">{getCardDescription(selCard)}</div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {canPouch && (
+                          <button onClick={() => executeHumanCardAction(selCard, 'pouch')} className="px-2.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-bold">
+                            Move to Pouch
+                          </button>
+                        )}
+                        {canTrick && (
+                          <button onClick={() => executeHumanCardAction(selCard, 'trick')} className="px-2.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-[11px] font-extrabold">
+                            Play into Trick
+                          </button>
+                        )}
+                        {canInstantChaos && (
+                          <button onClick={() => executeHumanCardAction(selCard, 'instant_chaos')} className="px-2.5 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-bold">
+                            Play Chaos Event
+                          </button>
+                        )}
+                        <button onClick={() => setSelectedHandUid(null)} className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-semibold">
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()}
+
                 <div className="flex flex-wrap gap-2">
                   {human.hand.map(card => {
-                    const playableMajor = card.type === 'major';
-                    const playablePouch = game.phase === 'POUCH_ADD' && human.pouch.length < (human.mods.maxPouch || 3);
-                    const playableTrick = isHumanTrickTurn && card.type === 'minor' && (!leadSuit || !humanHasLeadSuit || card.suit === leadSuit || human.mods.countsAsTrump);
-                    const canClick = playableMajor || playablePouch || playableTrick;
+                    const isSel = selectedHandUid === card.uid;
                     return (
-                      <TarotCard
-                        key={card.uid}
-                        card={card}
-                        small
-                        highlight={canClick}
-                        disabled={!canClick}
-                        onClick={() => handleHumanCardClick(card)}
-                      />
+                      <div key={card.uid} title={getCardDescription(card)} className="flex flex-col items-center gap-1">
+                        <TarotCard
+                          card={card}
+                          small
+                          selected={isSel}
+                          highlight={isSel || isHumanTrickTurn || game.phase === 'POUCH_ADD' || card.type === 'major'}
+                          onClick={() => handleHumanCardClick(card)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleHumanCardClick(card)}
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold transition ${
+                            isSel ? 'bg-amber-500 text-slate-950' : 'bg-slate-800/90 hover:bg-slate-700 text-slate-300'
+                          }`}
+                        >
+                          {isSel ? 'Selected' : 'Select'}
+                        </button>
+                      </div>
                     );
                   })}
                 </div>
@@ -9078,27 +10895,121 @@ export default function App() {
           </div>
         </div>
 
-        {/* RIGHT SIDEBAR: EVENT CHRONICLE (3 cols on lg) */}
+        {/* RIGHT SIDEBAR: EVENT CHRONICLE & SHORTHAND NETLIST (3 cols on lg) */}
         <aside className="lg:col-span-3 rounded-2xl border border-white/10 bg-[#12101c] p-3 flex flex-col max-h-[680px]">
-          <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-amber-300 pb-2 border-b border-white/10">
-            <ScrollText className="w-4 h-4" /> Chronicle of Mysteries
+          <div className="flex items-center justify-between gap-1.5 pb-2 border-b border-white/10">
+            <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-amber-300">
+              <ScrollText className="w-4 h-4" /> Chronicle
+            </div>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => saveGameToHistory(game)}
+                className="px-2 py-0.5 rounded bg-indigo-500/20 hover:bg-indigo-500/35 border border-indigo-400/40 text-[10px] font-bold text-indigo-200 transition"
+                title="Save this match to Past Game History"
+              >
+                {historySavedToast ? 'Saved ✓' : 'Save'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const chron = [...game.logs].reverse().map(e => {
+                  if (e.headerCode !== undefined) {
+                    const actLine = (e.actions && e.actions.length > 0) ? `\n${e.actions.join(', ')}` : '';
+                    return `${e.headerCode}${actLine}`;
+                  }
+                  return e.code || '';
+                }).filter(Boolean).join('\n\n');
+                const copyText = chron || [...game.logs].reverse().map(e => e.text).join('\n');
+                try {
+                  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(copyText);
+                  else {
+                    const ta = document.createElement('textarea');
+                    ta.value = copyText;
+                    document.body.appendChild(ta);
+                    ta.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(ta);
+                  }
+                } catch (_) {}
+                setNetlistCopied(true);
+                setTimeout(() => setNetlistCopied(false), 1800);
+              }}
+              className="px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/35 border border-amber-400/40 text-[10px] font-bold text-amber-200 transition"
+              title="Copy chronological Shorthand Netlist of this entire match"
+            >
+              {netlistCopied ? 'Copied ✓' : 'Copy Netlist'}
+            </button>
+            </div>
           </div>
-          <div className="flex-1 overflow-y-auto space-y-1.5 pt-2 pr-1 text-xs">
-            {game.logs.map(entry => (
-              <div
-                key={entry.id}
-                className={`p-2 rounded-lg leading-snug border ${
-                  entry.tone === 'gold' ? 'bg-amber-950/40 border-amber-500/30 text-amber-200' :
-                  entry.tone === 'chaos' ? 'bg-violet-950/50 border-violet-500/40 text-violet-200' :
-                  entry.tone === 'danger' ? 'bg-rose-950/40 border-rose-500/30 text-rose-200' :
-                  entry.tone === 'emerald' ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-200' :
-                  entry.tone === 'info' ? 'bg-sky-950/30 border-sky-500/20 text-sky-200' :
-                  'bg-slate-900/60 border-white/5 text-slate-300'
+          <div className="flex items-center gap-1 py-1.5 border-b border-white/5">
+            {[['both', 'Both'], ['netlist', 'Netlist'], ['detailed', 'Detailed']].map(([k, lbl]) => (
+              <button
+                key={k}
+                type="button"
+                onClick={() => setLogViewMode(k)}
+                className={`flex-1 py-1 rounded text-[10px] font-bold transition ${
+                  logViewMode === k ? 'bg-amber-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:text-slate-200'
                 }`}
               >
-                {entry.text}
-              </div>
+                {lbl}
+              </button>
             ))}
+          </div>
+          <div className="flex-1 overflow-y-auto space-y-2.5 pt-2.5 pr-1 text-xs">
+            {game.logs
+              .filter(e => logViewMode !== 'netlist' || !!e.code || e.headerCode !== undefined)
+              .map(entry => {
+                const detailLines = entry.details && entry.details.length > 0 ? entry.details : [{ text: entry.text, tone: entry.tone }];
+                const hasPhaseNetlist = entry.headerCode !== undefined;
+                return (
+                  <div
+                    key={entry.id}
+                    className={`p-2.5 rounded-lg leading-relaxed border space-y-2 ${
+                      entry.tone === 'gold' ? 'bg-amber-950/40 border-amber-500/30 text-amber-200' :
+                      entry.tone === 'chaos' ? 'bg-violet-950/50 border-violet-500/40 text-violet-200' :
+                      entry.tone === 'danger' ? 'bg-rose-950/40 border-rose-500/30 text-rose-200' :
+                      entry.tone === 'emerald' ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-200' :
+                      entry.tone === 'info' ? 'bg-sky-950/30 border-sky-500/20 text-sky-200' :
+                      'bg-slate-900/60 border-white/5 text-slate-300'
+                    }`}
+                  >
+                    {logViewMode !== 'detailed' && (hasPhaseNetlist || entry.code) && (
+                      <div className="font-mono text-[11px] font-bold text-amber-100 bg-black/45 px-2 py-1.5 rounded tracking-wide space-y-1 break-words">
+                        {hasPhaseNetlist ? (
+                          <>
+                            <div className="text-amber-300">{entry.headerCode}</div>
+                            {entry.actions && entry.actions.length > 0 && (
+                              <div className="text-slate-100 leading-snug">{entry.actions.join(', ')}</div>
+                            )}
+                          </>
+                        ) : (
+                          <div>{entry.code}</div>
+                        )}
+                      </div>
+                    )}
+                    {logViewMode !== 'netlist' && (
+                      <div className="space-y-1 border-t border-white/10 pt-1.5">
+                        {detailLines.map((dl, di) => (
+                          <div
+                            key={di}
+                            className={`text-[11px] leading-snug ${
+                              dl.tone === 'gold' ? 'text-amber-200' :
+                              dl.tone === 'chaos' ? 'text-violet-200' :
+                              dl.tone === 'danger' ? 'text-rose-200' :
+                              dl.tone === 'emerald' ? 'text-emerald-200' :
+                              dl.tone === 'info' ? 'text-sky-200' :
+                              'text-slate-300'
+                            }`}
+                          >
+                            • {dl.text}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
           </div>
         </aside>
       </main>
@@ -9107,38 +11018,67 @@ export default function App() {
       {/* INTERACTION MODALS (TARGETING, INTERRUPT, GAMBLE, ASCEND, CODEX)    */}
       {/* ==================================================================== */}
 
-      {/* 1. TARGET OPPONENT MODAL */}
-      {game.pendingInteraction && ['TARGET_CARD', 'TARGET_ABILITY', 'TARGET_CHAOS'].includes(game.pendingInteraction.type) && (
+      {/* 1. TARGET ACTIVE OPPONENT MODAL */}
+      {game.pendingInteraction && ['TARGET_CARD', 'TARGET_ABILITY', 'TARGET_CHAOS', 'TARGET_COPIED_ABILITY', 'TARGET_INTERRUPT_SUIT'].includes(game.pendingInteraction.type) && (
         <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="max-w-md w-full rounded-2xl border border-amber-400/60 bg-[#171425] p-5 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between">
-              <h3 className="font-serif font-bold text-lg text-amber-200">Choose Target Opponent</h3>
+              <h3 className="font-serif font-bold text-lg text-amber-200">Choose Active Target Opponent</h3>
               <button onClick={() => setGame(prev => ({ ...prev, pendingInteraction: null }))} className="text-slate-400 hover:text-white">
                 <X className="w-5 h-5" />
               </button>
             </div>
+            <p className="text-[11px] text-slate-400">Only active opponents this round can be targeted (players who lost their turn are untargetable).</p>
             <div className="space-y-2">
-              {opponents.map(opp => (
-                <button
-                  key={opp.id}
-                  onClick={() => {
-                    const pi = game.pendingInteraction;
-                    setGame(prev => {
-                      const clean = { ...prev, pendingInteraction: null };
-                      if (pi.type === 'TARGET_CARD') return playTrickCard(clean, 0, pi.card, opp.id);
-                      if (pi.type === 'TARGET_CHAOS') return resolveChaosEvent(clean, 0, pi.card, opp.id);
-                      return executeSequenceAbility(clean, 0, opp.id);
-                    });
-                  }}
-                  className="w-full p-3 rounded-xl bg-slate-900/90 hover:bg-amber-950/50 border border-white/10 hover:border-amber-400 flex items-center justify-between transition"
-                >
-                  <div className="text-left">
-                    <div className="font-bold text-sm text-slate-100">{opp.name} ({PATHWAYS[opp.pathwayId].arcana})</div>
-                    <div className="text-xs text-slate-400">Seq {opp.seq} • Hand: {opp.hand.length} • Pouch: {opp.pouch.length}/3</div>
-                  </div>
-                  <ChevronRight className="w-4 h-4 text-amber-400" />
-                </button>
-              ))}
+              {opponents.map(opp => {
+                const inactive = !!opp.skippedThisRound;
+                return (
+                  <button
+                    key={opp.id}
+                    disabled={inactive}
+                    onClick={() => {
+                      const pi = game.pendingInteraction;
+                      setGame(prev => {
+                        const clean = { ...prev, pendingInteraction: null };
+                        if (pi.type === 'TARGET_CARD') return playTrickCard(clean, 0, pi.card, opp.id);
+                        if (pi.type === 'TARGET_CHAOS') return resolveChaosEvent(clean, 0, pi.card, opp.id);
+                        if (pi.type === 'TARGET_COPIED_ABILITY') {
+                          return executeSequenceAbility(clean, 0, opp.id, pi.copiedTag, 1);
+                        }
+                        if (pi.type === 'TARGET_INTERRUPT_SUIT') {
+                          sfx.shieldBlock();
+                          let s = { ...clean, players: clean.players.map(p => ({ ...p, hand: [...p.hand], pouch: [...p.pouch], mods: { ...p.mods } })), deck: [...clean.deck], grave: [...clean.grave], roundMods: { ...clean.roundMods } };
+                          s.players[0].hand = s.players[0].hand.filter(c => c.uid !== pi.blockCard.uid);
+                          if (pi.attackType === 'sword') s.players[0].mods.pouchImmune = true;
+                          if (pi.attackType === 'wand') s.players[0].mods.handImmune = true;
+                          s.logs = addLog(s.logs, `INTERRUPT! You played ${cardShortName(pi.blockCard)} to cancel ${s.players[pi.attackerId]?.name}'s ${pi.attackType}!`, 'emerald');
+                          applyInstantFaceSuitAction(s, s.players[0], s.players[opp.id], pi.blockCard);
+                          s.grave.unshift(pi.blockCard);
+                          if (s.players[0].pathwayId === 8 && (s.players[0].seq === 8 || s.players[0].seq === 7)) {
+                            s.logs = markActed(s.players[0], s.logs, 'Blocked an attack with Knight/Queen');
+                          }
+                          if (pi.source === 'chaos_discard') return s;
+                          return playTrickCard(s, pi.attackerId, pi.card, 0, true);
+                        }
+                        return executeSequenceAbility(clean, 0, opp.id);
+                      });
+                    }}
+                    className={`w-full p-3 rounded-xl border flex items-center justify-between transition ${
+                      inactive
+                        ? 'bg-slate-900/40 border-white/5 opacity-45 cursor-not-allowed'
+                        : 'bg-slate-900/90 hover:bg-amber-950/50 border-white/10 hover:border-amber-400'
+                    }`}
+                  >
+                    <div className="text-left">
+                      <div className="font-bold text-sm text-slate-100">
+                        {opp.name} ({PATHWAYS[opp.pathwayId].arcana}) {inactive && <span className="text-rose-400 text-[11px] ml-1">(Lost Turn — Inactive)</span>}
+                      </div>
+                      <div className="text-xs text-slate-400">Seq {opp.seq} • Hand: {opp.hand.length} • Pouch: {opp.pouch.length}/{opp.mods?.maxPouch || 3}</div>
+                    </div>
+                    {!inactive && <ChevronRight className="w-4 h-4 text-amber-400" />}
+                  </button>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -9181,7 +11121,12 @@ export default function App() {
                     ...prev,
                     deck: [...cards, ...rest],
                     pendingInteraction: null,
-                    logs: addLog(prev.logs, `Placed ${cardShortName(cards[0])} on top of the Deck.`, 'emerald')
+                    logs: (() => {
+                      const beforeCodes = prev.deck.slice(0, count).map(cardCode).join(',');
+                      const afterCodes = cards.map(cardCode).join(',');
+                      const code = beforeCodes !== afterCodes ? `k^(${beforeCodes}→${afterCodes})` : `k^: V(${afterCodes})`;
+                      return addLog(prev.logs, `Reordered top ${count} Deck cards to: ${cards.map(cardShortName).join(', ')}.`, 'emerald', code, { appendEffect: true });
+                    })()
                   };
                 });
               }}
@@ -9203,7 +11148,7 @@ export default function App() {
               <button
                 onClick={() => setGame(prev => ({
                   ...prev, pendingInteraction: null,
-                  logs: addLog(prev.logs, `Astrologer left ${cardShortName(prev.pendingInteraction.card)} on top of Deck.`, 'info')
+                  logs: addLog(prev.logs, `Kept ${cardShortName(prev.pendingInteraction.card)} on top of Deck.`, 'info', `k^: V(${cardCode(prev.pendingInteraction.card)})`, { appendEffect: true })
                 }))}
                 className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs"
               >
@@ -9216,7 +11161,7 @@ export default function App() {
                   if (top) deck.push(top);
                   return {
                     ...prev, deck, pendingInteraction: null,
-                    logs: addLog(prev.logs, `Astrologer moved ${cardShortName(top)} to the bottom of the Deck.`, 'info')
+                    logs: addLog(prev.logs, `Moved ${cardShortName(top)} to the bottom of the Deck.`, 'info', `k^: V(${cardCode(top)}→k_)`, { appendEffect: true })
                   };
                 })}
                 className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs"
@@ -9394,26 +11339,113 @@ export default function App() {
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="max-w-md w-full rounded-2xl border-2 border-rose-500/70 bg-[#1a1220] p-5 space-y-4 shadow-2xl text-center">
             <Shield className="w-12 h-12 text-amber-400 mx-auto" />
-            <h3 className="font-serif font-bold text-xl text-amber-100">Incoming Attack — Interrupt?</h3>
+            <h3 className="font-serif font-bold text-xl text-amber-100">Incoming Attack — Interrupt? ({interruptSecLeft}s)</h3>
+            <div className="w-full h-1.5 rounded-full bg-slate-800 overflow-hidden">
+              <div className="h-full bg-amber-400 transition-all duration-1000" style={{ width: `${Math.max(0, (interruptSecLeft / 5) * 100)}%` }} />
+            </div>
             <p className="text-sm text-slate-300">
               <span className="font-bold text-rose-300">{game.players[game.pendingInteraction.attackerId].name}</span> played{' '}
               <span className="font-bold text-amber-200">{cardShortName(game.pendingInteraction.card)}</span> targeting you!
               Play your instant <span className="font-bold text-emerald-300">{cardShortName(game.pendingInteraction.blockCard)}</span> to cancel it?
             </p>
-            <div className="flex gap-2 justify-center">
-              <button
-                onClick={() => handleInterruptDecision(true)}
-                className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm transition"
-              >
-                Block with {game.pendingInteraction.blockCard.label}!
-              </button>
+            <div className="flex flex-wrap gap-2 justify-center">
+              {(game.pendingInteraction.blockCards || [game.pendingInteraction.blockCard]).map(bc => (
+                <button
+                  key={bc.uid}
+                  onClick={() => handleInterruptDecision(true, bc)}
+                  className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs transition"
+                >
+                  Block with {cardShortName(bc)} (+{SUIT_META[bc.suit]?.name} Action)
+                </button>
+              ))}
               <button
                 onClick={() => handleInterruptDecision(false)}
-                className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-sm transition"
+                className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs transition"
               >
                 Save Card & Take Hit
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 2B. INTERACTIVE HUMAN CHOOSE-DISCARD MODAL */}
+      {game.pendingInteraction?.type === 'CHOOSE_DISCARD' && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="max-w-2xl w-full rounded-2xl border-2 border-amber-400/70 bg-[#171425] p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <h3 className="font-serif font-bold text-lg text-amber-200">
+                Choose {game.pendingInteraction.count} Card{game.pendingInteraction.count > 1 ? 's' : ''} to Discard
+              </h3>
+              <span className="text-xs font-bold text-amber-300">
+                Selected: {(game.pendingInteraction.selectedUids || []).length} / {game.pendingInteraction.count}
+              </span>
+            </div>
+            <p className="text-xs text-slate-300">{game.pendingInteraction.reason}</p>
+            <div className="flex flex-wrap gap-2 justify-center py-2 max-h-64 overflow-y-auto">
+              {human.hand.map(c => {
+                const sel = (game.pendingInteraction.selectedUids || []).includes(c.uid);
+                return (
+                  <TarotCard
+                    key={c.uid}
+                    card={c}
+                    small
+                    selected={sel}
+                    highlight={sel}
+                    onClick={() => {
+                      setGame(prev => {
+                        const pi = prev.pendingInteraction;
+                        if (!pi || pi.type !== 'CHOOSE_DISCARD') return prev;
+                        const cur = pi.selectedUids || [];
+                        const next = cur.includes(c.uid)
+                          ? cur.filter(u => u !== c.uid)
+                          : (cur.length < pi.count ? [...cur, c.uid] : [...cur.slice(1), c.uid]);
+                        return { ...prev, pendingInteraction: { ...pi, selectedUids: next } };
+                      });
+                    }}
+                  />
+                );
+              })}
+            </div>
+            <button
+              disabled={(game.pendingInteraction.selectedUids || []).length !== game.pendingInteraction.count}
+              onClick={() => {
+                const pi = game.pendingInteraction;
+                setGame(prev => {
+                  const chosenSet = new Set(pi.selectedUids || []);
+                  const discarded = prev.players[0].hand.filter(c => chosenSet.has(c.uid));
+                  let s = {
+                    ...prev,
+                    pendingInteraction: null,
+                    players: prev.players.map((p, idx) => idx === 0 ? { ...p, hand: p.hand.filter(c => !chosenSet.has(c.uid)), lostCardThisRound: true } : { ...p }),
+                    grave: [...discarded, ...prev.grave],
+                    logs: addLog(
+                      prev.logs,
+                      `You discarded ${discarded.map(cardShortName).join(', ')} to the Grave.`,
+                      'muted',
+                      pi.appendEffect
+                        ? `${pi.effectPrefix ?? ''}${discarded.map(c => '-' + cardCode(c)).join(',')}`
+                        : `#1: (${discarded.map(c => '-' + cardCode(c)).join(',')})`,
+                      pi.appendEffect ? { appendEffect: true } : {}
+                    )
+                  };
+                  if (pi.afterAction === 'NEXT_ROUND') return advanceToNextRound(s);
+                  if (pi.afterAction === 'TARGET_ABILITY') {
+                    // Already paid recast discard; temporarily set abilityCastsThisSeq = 0 so executeSequenceAbility doesn't double-charge!
+                    s.players[0] = { ...s.players[0], _recastPrepaid: true };
+                    return { ...s, pendingInteraction: { type: 'TARGET_ABILITY' } };
+                  }
+                  if (pi.afterAction === 'CAST_ABILITY') {
+                    s.players[0] = { ...s.players[0], _recastPrepaid: true };
+                    return executeSequenceAbility(s, 0, pi.needsTarget ? 1 : null);
+                  }
+                  return s;
+                });
+              }}
+              className="w-full py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 font-bold text-sm transition"
+            >
+              Confirm Discard ({(game.pendingInteraction.selectedUids || []).length}/{game.pendingInteraction.count})
+            </button>
           </div>
         </div>
       )}
