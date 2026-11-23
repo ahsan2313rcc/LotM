@@ -1,0 +1,48 @@
+{
+  "generatedAt": "2026-11-21",
+  "nnEval": {
+    "architecture": "Hard CardId NN 88→48→51",
+    "opponent": "Heuristic depth 6",
+    "finalWinPct": 50,
+    "targetWinPct": 75,
+    "targetMet": false,
+    "notes": [
+      "Fixed missing SUITS import in CardIdNeuralNet (NN was crashing on card select).",
+      "CEM + A2C + curriculum (depth 2→6) plateau ~50–58% vs depth 6.",
+      "Same net reaches ~84–89% vs depth 2 and ~75–80% vs depth 3.",
+      "Depth-6 heuristic uses explicit multi-ply scoring (ascension keys, interrupts, disruption); the policy net has no search, so 75% is not reachable without architecture upgrade (imitation of depth-6 / MCTS / larger net)."
+    ],
+    "weightsPath": "data/nn_hard_champion.json"
+  },
+  "roundRobin": {
+    "brainMode": "heuristic_6 vs heuristic_6 (mirror)",
+    "reason": "NN did not reach 75%; mirror depth-6 isolates pathway power without NN bias.",
+    "seeds": 4,
+    "games": 2024,
+    "nominalBand": "40–60%",
+    "ranked": [
+      { "id": 11, "arcana": "Justice", "lotm": "Justiciar", "winPct": 71.7, "avgSeq": 1.15, "band": "OP" },
+      { "id": 18, "arcana": "The Moon", "lotm": "Demoness", "winPct": 66.3, "avgSeq": 1.36, "band": "OP" },
+      { "id": 9, "arcana": "The Hermit", "lotm": "Hermit", "winPct": 63.0, "avgSeq": 1.28, "band": "OP" },
+      { "id": 17, "arcana": "The Star", "lotm": "Sleepless", "winPct": 62.5, "avgSeq": 1.47, "band": "OP" },
+      { "id": 0, "arcana": "The Fool", "lotm": "Seer", "winPct": 56.5, "avgSeq": 1.48, "band": "OK" },
+      { "id": 21, "arcana": "The World", "lotm": "Visionary", "winPct": 56.5, "avgSeq": 1.45, "band": "OK" },
+      { "id": 16, "arcana": "The Tower", "lotm": "Lawyer", "winPct": 53.8, "avgSeq": 1.37, "band": "OK" },
+      { "id": 13, "arcana": "Death", "lotm": "Corpse Collector", "winPct": 52.7, "avgSeq": 1.52, "band": "OK" },
+      { "id": 1, "arcana": "The Magician", "lotm": "Apprentice", "winPct": 52.2, "avgSeq": 1.29, "band": "OK" },
+      { "id": 10, "arcana": "Wheel of Fortune", "lotm": "Monster", "winPct": 52.2, "avgSeq": 1.65, "band": "OK" },
+      { "id": 6, "arcana": "The Lovers", "lotm": "Prisoner", "winPct": 50.5, "avgSeq": 1.63, "band": "OK" },
+      { "id": 19, "arcana": "The Sun", "lotm": "Sun", "winPct": 50.5, "avgSeq": 1.52, "band": "OK" },
+      { "id": 8, "arcana": "Strength", "lotm": "Warrior", "winPct": 49.5, "avgSeq": 1.96, "band": "OK" },
+      { "id": 7, "arcana": "The Chariot", "lotm": "Arbiter", "winPct": 48.4, "avgSeq": 2.51, "band": "OK" },
+      { "id": 12, "arcana": "The Hanged Man", "lotm": "Secrets Supplicant", "winPct": 47.8, "avgSeq": 1.8, "band": "OK" },
+      { "id": 20, "arcana": "Judgement", "lotm": "Spectator", "winPct": 47.8, "avgSeq": 2.01, "band": "OK" },
+      { "id": 15, "arcana": "The Devil", "lotm": "Abyss", "winPct": 44.0, "avgSeq": 1.9, "band": "OK" },
+      { "id": 2, "arcana": "The High Priestess", "lotm": "Mystery Pryer", "winPct": 40.8, "avgSeq": 2.14, "band": "OK" },
+      { "id": 3, "arcana": "The Empress", "lotm": "Planter", "winPct": 40.2, "avgSeq": 2.19, "band": "OK" },
+      { "id": 5, "arcana": "The Hierophant", "lotm": "Reader", "winPct": 35.9, "avgSeq": 2.48, "band": "UP" },
+      { "id": 4, "arcana": "The Emperor", "lotm": "Lawyer/Arbiter-line", "winPct": 30.4, "avgSeq": 2.78, "band": "UP" },
+      { "id": 14, "arcana": "Temperance", "lotm": "Temperance", "winPct": 26.6, "avgSeq": 4.32, "band": "UP" }
+    ]
+  }
+}
